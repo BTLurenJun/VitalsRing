@@ -6,6 +6,7 @@
 - 只用 PyQt6 自带控件，不引入任何第三方库；
 - 本窗口不创建任何定时器，关闭后不留刷新任务（刷新仍由主窗口那唯一的定时器负责）；
 - 调试值不持久化：关闭窗口时清空，重新打开一律回到"调试模式关闭"。
+- 第 4 轮：补充『关于』区与真实仓库地址。
 """
 from __future__ import annotations
 
@@ -134,7 +135,10 @@ class SettingsWindow(QDialog):
         # ---- 关于（只读）：作者与仓库地址，字号比正文小一号、颜色 #8C919B ----
         about_box = QGroupBox("关于")
         about_layout = QVBoxLayout(about_box)
-        self._author_label = QLabel(f"作者：@{self._author}")
+        # 作者为空时显示"未填写"，避免出现孤零零的"作者：@"
+        self._author_label = QLabel(
+            f"作者：{'@' + self._author if self._author else '未填写'}"
+        )
         self._repo_label = QLabel(f"仓库：{self._repo_url}")
         for label in (self._author_label, self._repo_label):
             label.setStyleSheet("color: #8C919B; font-size: 11px;")

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""VitalsRing（环脉）主窗口 —— 第一阶段第 3 轮。
+"""VitalsRing（环脉）主窗口 —— 第一阶段第 4 轮。
 
 已完成范围：无边框置顶小窗 + 五个 QPainter 自绘环 + 两个文本行 + 失败红叉 + 版本号（第 1 轮）；
             点击环形/文字列表互切 + 两个文本行折叠展开（第 2 轮）；
-            设置窗口 + 调试模式 + 五项调试值 + 五项检测开关 + GitHub 预留按钮（第 3 轮）。
+            设置窗口 + 调试模式 + 五项调试值 + 五项检测开关 + GitHub 预留按钮（第 3 轮）；
+            第 4 轮：背景半透明降级 + 白条修复（背景画满整矩形 + 不透明遮罩裁角）。
 本轮不含：任务栏吸附定位（第二阶段）。
 安全边界：仅读取并显示系统信息，不修改任何系统设置、不写注册表、不删除文件。
 """
@@ -13,17 +14,18 @@ import ctypes
 import math
 import sys
 import traceback
+from ctypes import wintypes
 
 from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
-from PyQt6.QtGui import QColor, QCursor, QFont, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QCursor, QFont, QPainter, QPainterPath, QPen, QRegion
 from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
 from readers import ItemData, SystemReader
 from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
-# 第 3 轮起始 0.10.03.01，本轮内每次按反馈修改第四位递增
-APP_VERSION = "0.10.03.03"
+# 第 4 轮起始 0.10.04.01，本轮内每次按反馈修改第四位递增
+APP_VERSION = "0.10.04.02"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -175,6 +177,12 @@ class VitalPanel(QWidget):
             # 注意：不能拿 testAttribute() 当"检测"——属性刚设完必然返回 True，等于没检测。
             # 真正的降级只有两条：DWM 合成检查不通过，或 FORCE_OPAQUE_BACKGROUND 开关打开。
             self._translucent = True
+        else:
+            # 不透明兜底：关掉系统背景擦除，避免窗口首次显示时闪一下默认白底/灰底。
+            # 背景完全由 _draw_background() 自己画，不会再露出系统底色。
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # 原生样式兜底只做一次（showEvent 中调用），这里先置标志
+        self._native_style_applied = False
 
         self.setMinimumWidth(self.MIN_WIDTH)
         # 最大宽度直接取"五环排成一排"所需的宽度（5*D_MAX + 4*GAP_MIN + 2*PAD ≈ 364）。
@@ -187,6 +195,8 @@ class VitalPanel(QWidget):
         # 所有尺寸入口统一走 _clamp_width()，不在这里另写一套钳制规则。
         initial_width = self._clamp_width(self._max_width - 44)
         self.resize(initial_width, self.heightForWidth(initial_width))
+        # 先按当前模式算一次圆角遮罩：不透明兜底时首帧就不会露出四角底色
+        self._apply_round_mask()
 
         # 定时器只创建一次并长期复用：每次刷新都不新建 QTimer / 线程 / 对象（总需求第三条）
         self._timer = QTimer(self)
@@ -253,6 +263,13 @@ class VitalPanel(QWidget):
         super().showEvent(event)
         if DEBUG_LOG:
             print("[window] showEvent")
+        # 首次显示时做一次原生样式兜底：去掉标题栏/粗边框、保持工具窗口与不抢焦点
+        if not self._native_style_applied:
+            self._native_style_applied = True
+            self._apply_native_window_style()
+        # 兜底：显示时按当前尺寸重算遮罩，
+        # 防止隐藏期间改过尺寸或跨屏 DPI 变化后遮罩仍是旧尺寸
+        self._apply_round_mask()
         self._on_refresh_tick()
         # 调试模式期间不启动定时器，否则真实读数会把调试值冲掉
         if not self._reader.debug_active and not self._timer.isActive():
@@ -293,6 +310,8 @@ class VitalPanel(QWidget):
         """
         super().resizeEvent(event)
         try:
+            # 尺寸一变，圆角遮罩也要跟着重算；否则不透明模式下四角会露出旧尺寸的底色
+            self._apply_round_mask()
             if not self._fixing_size and self.width() > self._max_width:
                 # 防止任何路径把窗口拉成横跨屏幕的长条；尺寸同样走 _clamp_width()
                 fixed_w = self._clamp_width(self._max_width)
@@ -518,14 +537,93 @@ class VitalPanel(QWidget):
             y += self.LIST_ROW_H
 
     def _draw_background(self, painter: QPainter) -> None:
-        """绘制圆角背景：半透明可用时用深色半透明，不可用时用系统着色/固定深灰兜底。"""
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        """绘制圆角背景：半透明可用时用深色半透明，不可用时用系统着色/固定深灰兜底。
+
+        注意：矩形必须覆盖整个 self.rect()，不能内缩 0.5 像素——
+        内缩会留下 1 像素未绘制的边，在部分系统上表现为一圈细白条。
+        圆角本身由 drawRoundedRect 负责；不透明模式下四角由窗口遮罩裁掉（见 _apply_round_mask）。
+        """
+        rect = QRectF(self.rect())
         if self._translucent:
             painter.setBrush(QColor(20, 22, 26, 200))   # 深色半透明圆角背景
         else:
             painter.setBrush(self._bg_color)            # 不透明兜底，杜绝黑底/白条
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(rect, 12, 12)
+
+    def _apply_round_mask(self) -> None:
+        """半透明不可用时，用窗口遮罩裁出圆角。
+
+        注意：不透明窗口没法用 alpha 做圆角，四角会露出系统默认底色（常见就是白角/黑角），
+        看起来像"白条"。这里用 QRegion 遮罩把四角裁掉，既保留圆角外观，也不会露出底色。
+        半透明模式不用遮罩——遮罩会让圆弧边缘出现锯齿，交给 alpha 处理更平滑。
+
+        注意：setMask 同时裁剪鼠标命中，四角 12px 弧区点不到。当前齿轮按钮、缩放手柄斜线、
+        版本号都不在该区域（手柄 6 个端点已确认在遮罩内）；以后往窗口角落加控件时必须避开这 12px 弧区。
+        """
+        try:
+            if self._translucent:
+                self.clearMask()
+                return
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(self.rect()), 12, 12)
+            self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        except Exception:
+            traceback.print_exc()
+
+    def _apply_native_window_style(self) -> None:
+        """用 Win32 API 再确认一次"无边框、无白条、不进 Alt+Tab"的窗口样式。
+
+        注意：
+        - 只修改本窗口自己的样式位（hwnd 就是本窗口），不碰系统设置、注册表、任务栏配置；
+        - Qt 在正常环境下已设好这些标志，本函数等于兜底（无变化），只有个别系统才真正生效；
+          保留它是为了满足"必要时用 Win32 兜底"的需求；
+        - GWL_STYLE / GWL_EXSTYLE 是 32 位值，必须用 32 位 API。64 位下 GetWindowLongPtrW
+          若不声明 restype 会被 ctypes 按 c_int 截断（0x96000000 会变成负数）；
+          HWND 若不声明 argtypes 会被按 c_int 传，句柄超过 2³¹ 直接 OverflowError，
+          被外层 except 吞掉后样式静默失效；
+        - SetWindowLong 之后必须 SetWindowPos(..., SWP_FRAMECHANGED) 样式才会立即生效。
+        """
+        try:
+            if sys.platform != "win32":
+                return
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+
+            # use_last_error=True 才能让 ctypes.get_last_error() 拿到真实的 Win32 错误码
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            get_long = user32.GetWindowLongW
+            get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+            get_long.restype = wintypes.LONG
+            set_long = user32.SetWindowLongW
+            set_long.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+            set_long.restype = wintypes.LONG
+            set_pos = user32.SetWindowPos
+            set_pos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            set_pos.restype = wintypes.BOOL
+
+            GWL_STYLE, GWL_EXSTYLE = -16, -20
+            WS_POPUP, WS_CAPTION, WS_THICKFRAME = 0x80000000, 0x00C00000, 0x00040000
+            WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x00000080, 0x08000000
+
+            style = get_long(hwnd, GWL_STYLE)
+            style = (style | WS_POPUP) & ~WS_CAPTION & ~WS_THICKFRAME
+            ex_style = get_long(hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            set_long(hwnd, GWL_STYLE, style)
+            set_long(hwnd, GWL_EXSTYLE, ex_style)
+
+            SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER = 0x0001, 0x0002, 0x0004
+            SWP_NOACTIVATE, SWP_FRAMECHANGED = 0x0010, 0x0020
+            ok = set_pos(
+                hwnd, None, 0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            if not ok and DEBUG_LOG:
+                print("SetWindowPos failed:", ctypes.get_last_error())
+        except Exception:
+            traceback.print_exc()
 
     def _draw_ring_item(self, painter: QPainter, item: ItemData, x: float, y: float, d: int) -> None:
         """绘制单个环：灰色底环 + 低对比度刻度线 + 彩色进度弧（或失败红叉）+ 中心名称。"""
