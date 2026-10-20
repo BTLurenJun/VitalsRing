@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""VitalsRing（环脉）主窗口 —— 第一阶段第 4 轮。
+"""VitalsRing（环脉）主窗口 —— 第一阶段（第 1～4 轮）+ 第二阶段（任务栏吸附）。
 
 已完成范围：无边框置顶小窗 + 五个 QPainter 自绘环 + 两个文本行 + 失败红叉 + 版本号（第 1 轮）；
             点击环形/文字列表互切 + 两个文本行折叠展开（第 2 轮）；
             设置窗口 + 调试模式 + 五项调试值 + 五项检测开关 + GitHub 预留按钮（第 3 轮）；
-            第 4 轮：背景半透明降级 + 白条修复（背景画满整矩形 + 不透明遮罩裁角）。
-本轮不含：任务栏吸附定位（第二阶段）。
+            背景半透明降级 + 白条修复（背景画满整矩形 + 不透明遮罩裁角）（第 4 轮）；
+            第二阶段：任务栏吸附定位（贴任务栏左侧、自动隐藏跟随、全屏隐藏、DPI/分辨率变化重建、
+            Explorer 重启找回）。
 安全边界：仅读取并显示系统信息，不修改任何系统设置、不写注册表、不删除文件。
 """
 from __future__ import annotations
@@ -25,7 +26,7 @@ from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
 # 第 4 轮起始 0.10.04.01，本轮内每次按反馈修改第四位递增
-APP_VERSION = "0.10.04.02"
+APP_VERSION = "0.10.05.02"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -101,6 +102,296 @@ def _resolve_system_bg_color() -> QColor:
     return QColor("#1E1E1E")                 # 最终兜底：固定深灰
 
 
+# ---------------------------------------------------------------------------
+# 第二阶段：任务栏吸附定位用的只读 Win32 辅助
+# 约定：全部声明 argtypes / restype、全部 try/except 包裹、只读系统状态或只作用于本窗口，
+#       不修改系统设置、不改任务栏配置、不写注册表。
+# ---------------------------------------------------------------------------
+
+ABM_GETSTATE = 0x00000004          # SHAppBarMessage：读取任务栏状态
+ABS_AUTOHIDE = 0x00000001          # 状态位：任务栏已开启自动隐藏
+MONITOR_DEFAULTTONEAREST = 0x00000002
+WM_DPICHANGED = 0x02E0             # 窗口 DPI 变化
+WM_DISPLAYCHANGE = 0x007E          # 分辨率变化
+EVENT_SYSTEM_FOREGROUND = 0x0003   # 前台窗口变化事件（用于把挂件重新置顶到任务栏之上）
+WINEVENT_OUTOFCONTEXT = 0x0000
+WINEVENT_SKIPOWNPROCESS = 0x0002
+HWND_TOPMOST = -1
+
+# 第二阶段总开关：False 时完全回到第一阶段行为（可手动拖动、不自动定位）
+AUTO_DOCK_ENABLED = True
+DOCK_OFFSET_X = 4                  # 吸附时距离任务栏左边缘的偏移，避免贴着边缘
+DOCK_CHECK_MS = 4000               # 吸附状态检查间隔：3~5 秒，禁止高频轮询
+DOCK_MIN_WIDTH = 304              # 一排五环所需的最小宽度（<304 会变成 2×2+1 三行）
+
+# ---- 挂件模式（默认）固定布局常量 ----
+WIDGET_H_MAX = 44                  # 挂件高度上限（实际取 min(44, 任务栏高 - 4)）
+WIDGET_RING_GAP = 3                # 挂件里环与环之间的间距
+WIDGET_PAD = 3                     # 挂件内容与边缘的留白
+WIDGET_FALLBACK_H = 44             # 定位失败时的兜底高度（保持 188×44 的小条形态）
+
+# 挂件五环槽位：0/2/4 固定，1/3 可配（3 选 2、不重复）
+FIXED_SLOTS = {0: "cpu", 2: "gpu", 4: "settings"}
+CONFIGURABLE_SLOTS = (1, 3)
+SLOT_POOL = ("mem", "disk", "battery")
+SLOT_LABELS = {
+    "cpu": "CPU", "mem": "内存", "gpu": "GPU",
+    "disk": "C盘", "battery": "电池", "settings": "设置",
+}
+DEFAULT_SLOT_KEYS = ["cpu", "mem", "gpu", "disk", "settings"]
+
+# SetWindowPos 常用标志位（层级修复用）
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+
+# 前台窗口事件回调原型：保留为模块级，供实例保存引用（防止被 GC 后变成野指针）
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None,
+    wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+    wintypes.LONG, wintypes.LONG, wintypes.DWORD, wintypes.DWORD,
+)
+
+
+class _AppBarData(ctypes.Structure):
+    """SHAppBarMessage 需要的 APPBARDATA 结构，仅用于读取任务栏状态。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uCallbackMessage", wintypes.UINT),
+        ("uEdge", wintypes.UINT),
+        ("rc", wintypes.RECT),
+        ("lParam", wintypes.LPARAM),
+    ]
+
+
+class _MonitorInfo(ctypes.Structure):
+    """GetMonitorInfoW 需要的 MONITORINFO 结构（读取显示器物理边界）。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+_WINDOWS_API = None
+
+
+def _windows_api():
+    """建立并缓存 user32 / shell32 的函数原型（只创建一次，避免重复开销）。
+
+    注意：
+    - 所有函数都声明 argtypes / restype。64 位下句柄若按 c_int 传会被截断甚至 OverflowError；
+    - 这些调用只读系统状态，或只作用于本进程自己的窗口，不改系统设置、不写注册表；
+    - 本函数自身可能抛异常，调用方必须先判断返回值再使用。
+    """
+    global _WINDOWS_API
+    if _WINDOWS_API is not None:
+        return _WINDOWS_API
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+    find_window = user32.FindWindowW
+    find_window.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    find_window.restype = wintypes.HWND
+
+    get_rect = user32.GetWindowRect
+    get_rect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    get_rect.restype = wintypes.BOOL
+
+    get_class = user32.GetClassNameW
+    get_class.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    get_class.restype = ctypes.c_int
+
+    get_foreground = user32.GetForegroundWindow
+    get_foreground.argtypes = []
+    get_foreground.restype = wintypes.HWND
+
+    get_cursor = user32.GetCursorPos
+    get_cursor.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    get_cursor.restype = wintypes.BOOL
+
+    monitor_from = user32.MonitorFromWindow
+    monitor_from.argtypes = [wintypes.HWND, wintypes.DWORD]
+    monitor_from.restype = wintypes.HMONITOR
+
+    get_monitor = user32.GetMonitorInfoW
+    get_monitor.argtypes = [wintypes.HMONITOR, ctypes.POINTER(_MonitorInfo)]
+    get_monitor.restype = wintypes.BOOL
+
+    register_msg = user32.RegisterWindowMessageW
+    register_msg.argtypes = [wintypes.LPCWSTR]
+    register_msg.restype = wintypes.UINT
+
+    enum_child = user32.EnumChildWindows
+    enum_child.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.LPARAM]
+    enum_child.restype = wintypes.BOOL
+
+    sh_appbar = shell32.SHAppBarMessage
+    sh_appbar.argtypes = [wintypes.DWORD, ctypes.POINTER(_AppBarData)]
+    sh_appbar.restype = ctypes.c_size_t
+
+    # 层级修复用：把本窗口重新置顶到任务栏之上（只作用于本窗口）
+    set_pos = user32.SetWindowPos
+    set_pos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    set_pos.restype = wintypes.BOOL
+
+    # 前台窗口变化钩子：回调只做"重新置顶"，不改任何系统状态
+    set_hook = user32.SetWinEventHook
+    set_hook.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE,
+                         ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+    set_hook.restype = wintypes.HANDLE
+
+    unhook = user32.UnhookWinEvent
+    unhook.argtypes = [wintypes.HANDLE]
+    unhook.restype = wintypes.BOOL
+
+    _WINDOWS_API = {
+        "find_window": find_window,
+        "get_rect": get_rect,
+        "get_class": get_class,
+        "get_foreground": get_foreground,
+        "get_cursor": get_cursor,
+        "monitor_from": monitor_from,
+        "get_monitor": get_monitor,
+        "register_msg": register_msg,
+        "enum_child": enum_child,
+        "sh_appbar": sh_appbar,
+        "set_pos": set_pos,
+        "set_hook": set_hook,
+        "unhook": unhook,
+        "user32": user32,
+    }
+    return _WINDOWS_API
+
+
+def _window_class_name(hwnd) -> str:
+    """读取窗口类名（只读）。失败返回空串。"""
+    try:
+        api = _windows_api()
+        buf = ctypes.create_unicode_buffer(256)
+        if api["get_class"](hwnd, buf, 256):
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+
+def _taskbar_rect():
+    """返回任务栏（Shell_TrayWnd）的物理像素矩形 (left, top, right, bottom)；失败返回 None。"""
+    try:
+        api = _windows_api()
+        hwnd = api["find_window"]("Shell_TrayWnd", None)
+        if not hwnd:
+            return None
+        rc = wintypes.RECT()
+        if not api["get_rect"](hwnd, ctypes.byref(rc)):
+            return None
+        if rc.right <= rc.left or rc.bottom <= rc.top:
+            return None
+        return (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom))
+    except Exception:
+        return None
+
+
+def _start_button_rect():
+    """尝试读取"开始"按钮的物理像素矩形；读不到返回 None。
+
+    注意：Windows 11 的任务栏是 XAML 实现，开始按钮不一定是独立 HWND，
+    因此这里找不到属正常情况（此时按"左侧为空白区"处理，并在报告里说明）。
+    """
+    try:
+        api = _windows_api()
+        candidates = []
+        hwnd = api["find_window"]("Start", None)
+        if hwnd:
+            candidates.append(hwnd)
+
+        found = []
+
+        def _cb(child, _lparam):
+            try:
+                if _window_class_name(child).lower() == "start":
+                    found.append(child)
+                    return False        # 找到即停止枚举
+            except Exception:
+                pass
+            return True
+
+        callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(_cb)
+        taskbar = api["find_window"]("Shell_TrayWnd", None)
+        if taskbar:
+            api["enum_child"](taskbar, ctypes.cast(callback, ctypes.c_void_p), 0)
+        candidates.extend(found)
+
+        for h in candidates:
+            rc = wintypes.RECT()
+            if api["get_rect"](h, ctypes.byref(rc)) and rc.right > rc.left:
+                return (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom))
+    except Exception:
+        pass
+    return None
+
+
+def _taskbar_autohide() -> bool:
+    """任务栏是否开启了"自动隐藏"。读取失败返回 False（按未自动隐藏处理）。"""
+    try:
+        api = _windows_api()
+        data = _AppBarData()
+        data.cbSize = ctypes.sizeof(_AppBarData)
+        state = api["sh_appbar"](ABM_GETSTATE, ctypes.byref(data))
+        return bool(state & ABS_AUTOHIDE)
+    except Exception:
+        return False
+
+
+def _foreground_fullscreen() -> bool:
+    """前台窗口是否覆盖其所在显示器的整个屏幕（全屏程序/游戏）。
+
+    注意：必须排除桌面与任务栏本身（它们的矩形同样覆盖全屏），
+    否则会误判为全屏程序而把面板一直藏起来。
+    """
+    try:
+        api = _windows_api()
+        hwnd = api["get_foreground"]()
+        if not hwnd:
+            return False
+        cls = _window_class_name(hwnd).lower()
+        if cls in ("shell_traywnd", "progman", "workerw"):
+            return False
+        rc = wintypes.RECT()
+        if not api["get_rect"](hwnd, ctypes.byref(rc)):
+            return False
+        monitor = api["monitor_from"](hwnd, MONITOR_DEFAULTTONEAREST)
+        info = _MonitorInfo()
+        info.cbSize = ctypes.sizeof(_MonitorInfo)
+        if not api["get_monitor"](monitor, ctypes.byref(info)):
+            return False
+        mon = info.rcMonitor
+        tol = 2          # 允许 2 像素误差，避免边框/阴影导致误判
+        return (abs(rc.left - mon.left) <= tol and abs(rc.top - mon.top) <= tol
+                and abs(rc.right - mon.right) <= tol and abs(rc.bottom - mon.bottom) <= tol)
+    except Exception:
+        return False
+
+
+def _register_taskbar_created() -> int:
+    """注册 "TaskbarCreated" 消息，Explorer 重启后任务栏重建时会广播它。
+
+    注意：注册失败返回 0；此时只是失去"Explorer 重启"的即时感知能力，
+    4 秒一次的定位检查仍会把面板重新贴回任务栏，不影响正常使用。
+    """
+    try:
+        return int(_windows_api()["register_msg"]("TaskbarCreated"))
+    except Exception:
+        return 0
+
+
 class VitalPanel(QWidget):
     """主面板窗口：负责窗口外观、定时刷新与全部自绘内容。
 
@@ -128,6 +419,19 @@ class VitalPanel(QWidget):
     def __init__(self, reader: SystemReader) -> None:
         super().__init__()
         self._reader = reader
+        # ---- 界面模式：默认挂件（widget），可切大面板（panel）；不持久化 ----
+        self._layout_mode = "widget"
+        self._switching_mode = False               # 切换模式防重入
+        # ---- 挂件五环槽位：0/2/4 固定，1/3 可配；不持久化，重启回默认 ----
+        self._slot_keys = list(DEFAULT_SLOT_KEYS)
+        # 挂件尺寸缓存：paintEvent 绝不调用 Win32，这里只保存最后一次算好的值
+        self._widget_h = WIDGET_FALLBACK_H
+        self._widget_d = self._widget_h - 10
+        self._widget_w = self._widget_width_for(self._widget_h)
+        self._detail = None                        # 详情窗口（懒创建、复用）
+        # 前台事件钩子：句柄与回调对象都必须保存在实例上，回调对象一旦被 GC 会变成野指针
+        self._win_event_hook = None
+        self._win_event_proc = None
         # 鼠标交互状态：拖拽移动 / 右下角调整宽度 / 点击切换
         self._dragging = False
         self._resizing = False
@@ -184,7 +488,7 @@ class VitalPanel(QWidget):
         # 原生样式兜底只做一次（showEvent 中调用），这里先置标志
         self._native_style_applied = False
 
-        self.setMinimumWidth(self.MIN_WIDTH)
+        self.setMinimumWidth(self._min_width_for_mode())
         # 最大宽度直接取"五环排成一排"所需的宽度（5*D_MAX + 4*GAP_MIN + 2*PAD ≈ 364）。
         # 注意：再宽没有任何意义——环只会居中、两侧留白，窗口会被拉成横跨屏幕的长条，
         # 还会把右下角的缩放手柄推到屏幕可见范围之外，导致"手柄拉不动"。
@@ -207,6 +511,33 @@ class VitalPanel(QWidget):
         # 右键菜单只创建一次并复用：每次右键都 new QMenu 会作为子对象一直挂在窗口上，越点越多
         self._menu = QMenu(self)
         self._menu.addAction("退出 VitalsRing").triggered.connect(QApplication.instance().quit)
+        # 挂件模式的右键菜单（设置… / 退出），同样只创建一次
+        self._widget_menu = QMenu(self)
+        self._widget_menu.addAction("设置…").triggered.connect(self._open_settings)
+        self._widget_menu.addAction("退出 VitalsRing").triggered.connect(QApplication.instance().quit)
+
+        # ---- 界面模式：默认挂件（widget），可切大面板（panel）；不持久化 ----
+        self._switching_mode = False               # 切换模式防重入
+        # ---- 挂件五环槽位：0/2/4 固定，1/3 可配；不持久化，重启回默认 ----
+        # （这两个状态在 __init__ 开头已初始化，这里不再重复赋值）
+        # 前台事件钩子：句柄与回调对象都必须保存在实例上，回调对象一旦被 GC 会变成野指针
+        self._win_event_hook = None
+        self._win_event_proc = None
+
+        # ---- 第二阶段：任务栏吸附状态（不持久化，重启回到默认勾选）----
+        self._auto_dock_enabled = bool(AUTO_DOCK_ENABLED)   # 用户开关，设置窗口可改
+        self._docked = False                                # 当前是否真的贴在任务栏上
+        self._docking = False                               # 防重入：定位过程会触发移动/DPI 事件
+        self._dock_rect = None                              # 上次吸附时的任务栏矩形（物理像素）
+        self._taskbar_created_msg = _register_taskbar_created()
+        self.dock_status_text = "尚未定位"                   # 给设置窗口读的状态文案
+
+        # 吸附检查定时器：整个程序只新增这一个，且长期复用。
+        # 间隔 4 秒（落在要求的 3~5 秒内），禁止高频轮询；关闭吸附时直接 stop()。
+        self._dock_timer = QTimer(self)
+        self._dock_timer.setInterval(DOCK_CHECK_MS)
+        self._dock_timer.timeout.connect(self._on_dock_tick)
+        # 注意：不在这里 start —— 启动流程是"构造即挂件 → showEvent 完成首次吸附后再启动"
 
     # ------------------------------------------------------------------ 刷新
 
@@ -248,9 +579,13 @@ class VitalPanel(QWidget):
             traceback.print_exc()
 
     def hideEvent(self, event) -> None:
-        """窗口隐藏时暂停定时刷新，避免看不见时仍白耗 CPU/内存（总需求第三条）。"""
+        """窗口隐藏时暂停定时刷新，避免看不见时仍白耗 CPU/内存（总需求第三条）。
+
+        挂件因全屏/自动隐藏而 hide() 时，详情窗口必须一起关闭，避免留下孤立的浮窗。
+        """
         if DEBUG_LOG:
             print("[window] hideEvent")
+        self._close_detail()
         self._timer.stop()
         super().hideEvent(event)
 
@@ -270,6 +605,14 @@ class VitalPanel(QWidget):
         # 兜底：显示时按当前尺寸重算遮罩，
         # 防止隐藏期间改过尺寸或跨屏 DPI 变化后遮罩仍是旧尺寸
         self._apply_round_mask()
+        if self._layout_mode == "widget":
+            # 启动流程：showEvent 完成首次吸附 → 安装前台钩子 → 启动吸附定时器
+            if AUTO_DOCK_ENABLED and self._auto_dock_enabled and not self._docked:
+                self._dock_now()
+            self._install_win_event_hook()
+            self._raise_above_taskbar()
+            if AUTO_DOCK_ENABLED and self._auto_dock_enabled and not self._dock_timer.isActive():
+                self._dock_timer.start()
         self._on_refresh_tick()
         # 调试模式期间不启动定时器，否则真实读数会把调试值冲掉
         if not self._reader.debug_active and not self._timer.isActive():
@@ -299,6 +642,9 @@ class VitalPanel(QWidget):
         只停表的话 app.exec() 不会返回、python 进程会一直驻留后台，所以这里必须显式 quit()。
         """
         self._timer.stop()
+        self._dock_timer.stop()          # 吸附检查也要停，避免退出前还留下刷新任务
+        self._close_detail()
+        self._uninstall_win_event_hook()  # 关窗必须卸载前台钩子，避免回调打到已销毁窗口
         QApplication.instance().quit()
         super().closeEvent(event)
 
@@ -393,21 +739,22 @@ class VitalPanel(QWidget):
         return int(5 * self.D_MAX + 4 * self.GAP_MIN + 2 * self.PAD)
 
     def _clamp_width(self, width: int) -> int:
-        """把宽度统一钳制到 [MIN_WIDTH, _max_width]，任何入口都先过这一道。
+        """把宽度统一钳制到当前模式允许的范围，任何入口都先过这一道。
 
-        好处：无论调用方传进来 0、负数、3840 还是旧的超宽值，环都只会在
-        "一排 364"以内铺满，不会出现两侧留白或算错位置。
+        挂件模式宽度由布局固定（188 一类的值），大面板模式才是 [MIN_WIDTH, _max_width]。
         """
+        if self._layout_mode == "widget":
+            return int(self._widget_w)
         return int(max(self.MIN_WIDTH, min(self._max_width, width)))
 
     def _ring_grid(self, width: int):
         """根据窗口宽度决定排列方式，返回 (行数, 环直径)。
 
-        规则（已与用户确认）：优先一排 5 个；放不下时改为 2×2+1 三行排列，顺序不变。
-        环直径始终限制在 [D_MIN, D_MAX] 之间，绝不为了塞下窗口把环缩到看不清。
-
-        入口先钳制宽度：保证环永远只在"一排 364"以内铺满，不会出现居中留白。
+        挂件模式：固定一排、环直径由挂件高度决定；大面板模式：优先一排 5 个，
+        放不下时改 2×2+1 三行。
         """
+        if self._layout_mode == "widget":
+            return 1, int(self._widget_d)
         width = self._clamp_width(width)
         content = max(1, width - 2 * self.PAD)
         # 一排 5 个：需要 5 个环 + 4 个间距
@@ -419,10 +766,12 @@ class VitalPanel(QWidget):
         return 3, max(self.D_MIN, int(d))
 
     def _ring_positions(self, width: int):
-        """计算五个环各自的左上角坐标，返回 [(x, y, d) × 5]，顺序固定为 CPU/内存/GPU/C盘/电池。
+        """计算五个环各自的左上角坐标，返回 [(x, y, d) × 5]。
 
-        入口先钳制宽度：与 _ring_grid 用同一套宽度口径，避免"用宽宽算位置、用窄窄算直径"的错位。
+        挂件模式按固定槽位排布；大面板模式顺序固定为 CPU/内存/GPU/C盘/电池。
         """
+        if self._layout_mode == "widget":
+            return self._widget_ring_positions()
         width = self._clamp_width(width)
         rows, d = self._ring_grid(width)
         content = width - 2 * self.PAD
@@ -461,11 +810,11 @@ class VitalPanel(QWidget):
     def heightForWidth(self, width: int) -> int:
         """根据宽度与当前模式计算窗口高度，保证内容不被裁切、切换模式时不跳动。
 
-        入口先钳制宽度：防止外界传进 0、负数、3840 之类的极端值，导致算高时崩掉或错位。
-
-        注意：文本行折叠后仍占一行（只留标题），所以这里固定按两行计算，
-        高度不随折叠变化——折叠只隐藏内容，不会让窗口高度抖一下。
+        挂件模式高度固定（由任务栏高度推出）；大面板模式按环形/文字列表排版计算。
+        入口先钳制宽度：防止外界传进 0、负数、3840 之类的极端值。
         """
+        if self._layout_mode == "widget":
+            return int(self._widget_h)
         width = self._clamp_width(width)
         if self._list_mode:
             block_h = 5 * self.LIST_ROW_H
@@ -499,15 +848,19 @@ class VitalPanel(QWidget):
 
             self._draw_background(painter)
 
-            block_bottom = self._block_bottom(self.width())
-            if self._list_mode:
-                self._draw_list(painter)
+            if self._layout_mode == "widget":
+                # 挂件模式：只画五个小环（含设置环），没有任何文本行/版本号/齿轮/手柄
+                self._draw_widget(painter)
             else:
-                for item, (x, y, d) in zip(self._reader.items, self._ring_positions(self.width())):
-                    self._draw_ring_item(painter, item, x, y, d)
-            self._draw_text_rows(painter, block_bottom)
-            self._draw_gear(painter)
-            self._draw_resize_hint(painter)
+                block_bottom = self._block_bottom(self.width())
+                if self._list_mode:
+                    self._draw_list(painter)
+                else:
+                    for item, (x, y, d) in zip(self._reader.items, self._ring_positions(self.width())):
+                        self._draw_ring_item(painter, item, x, y, d)
+                self._draw_text_rows(painter, block_bottom)
+                self._draw_gear(painter)
+                self._draw_resize_hint(painter)
         except Exception:
             traceback.print_exc()
         finally:
@@ -550,6 +903,66 @@ class VitalPanel(QWidget):
             painter.setBrush(self._bg_color)            # 不透明兜底，杜绝黑底/白条
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(rect, 12, 12)
+
+    def _draw_widget(self, painter: QPainter) -> None:
+        """挂件模式：按 _slot_keys 画五个小环（设置环不画弧、不画红叉）。"""
+        items = {item.key: item for item in self._reader.items}
+        for key, (x, y, d) in zip(self._slot_keys, self._widget_ring_positions()):
+            if key == "settings":
+                self._draw_widget_ring(painter, None, x, y, d)
+            else:
+                self._draw_widget_ring(painter, items.get(key), x, y, d)
+
+    def _draw_widget_ring(self, painter: QPainter, item, x: float, y: float, d: int) -> None:
+        """画挂件里的单个环：灰底环 + 刻度 + 进度弧/红叉 + 中心名称（7pt）。
+
+        注意：
+        - 环内只有名称，没有任何数字；失败项不在环下写原因（挂件空间不够）；
+        - 设置环（item=None）只画底环 + 刻度 + "设置"，永不画红叉、不参与数据刷新。
+        """
+        cx = x + d / 2.0
+        cy = y + d / 2.0
+        outer = d / 2.0 - 3.0
+        thickness = max(3.0, d * 0.13)
+        r_mid = outer - thickness / 2.0
+
+        # 1) 灰色底环
+        painter.setPen(QPen(QColor(255, 255, 255, 38), thickness))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), r_mid, r_mid)
+
+        # 2) 低对比度刻度线（只画线，不带任何数字标签）
+        painter.setPen(QPen(QColor(255, 255, 255, 46), 1))
+        step = 360.0 / self.TICKS
+        for i in range(self.TICKS):
+            ang = math.radians(90.0 - i * step)
+            dx, dy = math.cos(ang), -math.sin(ang)
+            painter.drawLine(
+                QPointF(cx + dx * (outer + 0.8), cy + dy * (outer + 0.8)),
+                QPointF(cx + dx * (outer + 2.6), cy + dy * (outer + 2.6)),
+            )
+
+        # 3) 进度弧（数据环正常时）或红叉（数据环失败时）；设置环两者都不画
+        if item is not None:
+            if item.is_ok:
+                painter.setPen(QPen(_value_color(item), thickness,
+                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                rect = QRectF(cx - r_mid, cy - r_mid, 2 * r_mid, 2 * r_mid)
+                span = -int(round((item.value or 0.0) / 100.0 * 360 * 16))
+                if span != 0:
+                    painter.drawArc(rect, 90 * 16, span)
+            else:
+                # 小环内洞要按比例缩小，否则红叉会被裁得看不见
+                self._draw_fail_cross(painter, cx, cy, outer, thickness,
+                                      inner=max(7.0, outer * 0.45))
+
+        # 4) 中心只写名称（7pt），不出现任何数字
+        name = SLOT_LABELS.get("settings" if item is None else item.key, "")
+        painter.setPen(QColor(230, 233, 238))
+        font = QFont()
+        font.setPointSize(7)
+        painter.setFont(font)
+        painter.drawText(QRectF(x, y, d, d), Qt.AlignmentFlag.AlignCenter, name)
 
     def _apply_round_mask(self) -> None:
         """半透明不可用时，用窗口遮罩裁出圆角。
@@ -625,6 +1038,446 @@ class VitalPanel(QWidget):
         except Exception:
             traceback.print_exc()
 
+    # ------------------------------------------------------------------ 界面模式与挂件
+
+    def layout_mode(self) -> str:
+        """当前界面模式：widget（任务栏挂件）/ panel（大面板）。"""
+        return self._layout_mode
+
+    def slot_keys(self) -> list:
+        """挂件五环槽位的当前配置（副本，避免外部直接改动内部列表）。"""
+        return list(self._slot_keys)
+
+    def _widget_width_for(self, height: int) -> int:
+        """按挂件高度算固定宽度：5 个环 + 4 个间距 + 两侧留白。"""
+        d = max(1, height - 10)
+        return 5 * d + 4 * WIDGET_RING_GAP + 2 * WIDGET_PAD
+
+    def _min_width_for_mode(self) -> int:
+        """不同模式的最小宽度：挂件固定宽度，大面板沿用 MIN_WIDTH。"""
+        return self._widget_w if self._layout_mode == "widget" else self.MIN_WIDTH
+
+    def _update_widget_metrics(self) -> None:
+        """按任务栏高度刷新挂件尺寸缓存。
+
+        注意：只在定位/切换模式时调用；paintEvent 只读缓存，绝不在这里调用 Win32。
+        高度 = min(44, 任务栏高 - 4)；环直径 = 高度 - 10。
+        """
+        try:
+            h = WIDGET_FALLBACK_H
+            rect = _taskbar_rect()
+            screen = QApplication.primaryScreen()
+            if rect is not None and screen is not None:
+                dpr = max(1.0, float(screen.devicePixelRatio()))
+                tb_h = int(round((rect[3] - rect[1]) / dpr))
+                h = max(24, min(WIDGET_H_MAX, tb_h - 4))
+            self._widget_h = h
+            self._widget_d = h - 10
+            self._widget_w = self._widget_width_for(h)
+        except Exception:
+            traceback.print_exc()
+
+    def _widget_ring_positions(self):
+        """挂件五环的 (x, y, d)：横向紧排，垂直居中。"""
+        d = self._widget_d
+        y = (self._widget_h - d) / 2.0
+        x = float(WIDGET_PAD)
+        out = []
+        for _ in range(5):
+            out.append((x, y, d))
+            x += d + WIDGET_RING_GAP
+        return out
+
+    def set_layout_mode(self, mode: str) -> None:
+        """切换挂件 / 大面板。只调整模式状态与布局，不重建窗口对象。
+
+        注意：用 _switching_mode 防重入——切模式过程中会 resize/move，
+        可能再次触发相关事件。
+        """
+        if mode not in ("widget", "panel") or mode == self._layout_mode:
+            return
+        if self._switching_mode:
+            return
+        self._switching_mode = True
+        try:
+            self._layout_mode = mode
+            self._apply_layout_mode()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self._switching_mode = False
+
+    def _apply_layout_mode(self) -> None:
+        """按当前模式套用尺寸、遮罩、吸附与事件钩子。"""
+        try:
+            if self._settings is not None:
+                self._settings.sync_layout_mode(self._layout_mode)
+
+            if self._layout_mode == "widget":
+                self._close_detail()
+                self._update_widget_metrics()
+                self.setMinimumWidth(self._widget_w)
+                self.setMaximumWidth(self._widget_w)
+                self.resize(self._widget_w, self._widget_h)
+                self._apply_round_mask()
+                if AUTO_DOCK_ENABLED and self._auto_dock_enabled:
+                    self._dock_now()
+                    if not self._dock_timer.isActive():
+                        self._dock_timer.start()
+                self._install_win_event_hook()
+                self._raise_above_taskbar()
+            else:
+                self._uninstall_win_event_hook()
+                self._dock_timer.stop()
+                self._docked = False
+                self._dock_rect = None
+                self.dock_status_text = "大面板模式不吸附"
+                self._close_detail()
+                self.setMinimumWidth(self.MIN_WIDTH)
+                self.setMaximumWidth(self._max_width)
+                # 大面板宽度回到"上限 - 44"（约 320），避免沿用挂件的 188
+                w = self._clamp_width(self._max_width - 44)
+                self.resize(w, self.heightForWidth(w))
+                self._apply_round_mask()
+                self._keep_on_screen()
+                self._apply_native_window_style()
+            self.update()
+        except Exception:
+            traceback.print_exc()
+
+    def set_slot_config(self, keys) -> bool:
+        """校验并应用挂件五环配置；校验失败返回 False 且不改变当前配置。
+
+        规则：长度 5；第 1/3/5 位固定为 cpu/gpu/settings；第 2/4 位必须非空、
+        互不相同、且都属于 SLOT_POOL（mem/disk/battery）。
+        """
+        try:
+            if not isinstance(keys, (list, tuple)) or len(keys) != 5:
+                return False
+            if keys[0] != "cpu" or keys[2] != "gpu" or keys[4] != "settings":
+                return False
+            slot1, slot3 = keys[1], keys[3]
+            if not slot1 or not slot3 or slot1 == slot3:
+                return False
+            if slot1 not in SLOT_POOL or slot3 not in SLOT_POOL:
+                return False
+            self._slot_keys = list(keys)
+            if self._settings is not None:
+                self._settings.sync_slot_combos()
+            self.update()
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _raise_above_taskbar(self) -> None:
+        """把挂件重新置顶到任务栏之上——只作用于本窗口，不改系统设置。"""
+        if self._layout_mode != "widget":
+            return
+        try:
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            api = _windows_api()
+            api["set_pos"](
+                hwnd, wintypes.HWND(HWND_TOPMOST), 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        except Exception:
+            traceback.print_exc()
+
+    def _on_foreground_event(self, hook, event, hwnd, id_object, id_child, thread, when) -> None:
+        """前台窗口变化回调：只把挂件重新置顶，整体 try/except。"""
+        try:
+            self._raise_above_taskbar()
+        except Exception:
+            traceback.print_exc()
+
+    def _install_win_event_hook(self) -> None:
+        """安装前台窗口变化钩子（仅挂件模式）。失败只提示，退化为 4 秒 tick 置顶。"""
+        if self._layout_mode != "widget" or not AUTO_DOCK_ENABLED:
+            return
+        if self._win_event_hook:
+            return
+        try:
+            api = _windows_api()
+            if self._win_event_proc is None:
+                # 回调对象必须保存在实例属性上：否则会被 GC 回收，Windows 回调野指针直接崩溃
+                self._win_event_proc = WINEVENTPROC(self._on_foreground_event)
+            self._win_event_hook = api["set_hook"](
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None,
+                ctypes.cast(self._win_event_proc, ctypes.c_void_p),
+                0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+            if not self._win_event_hook:
+                print("[dock] SetWinEventHook 失败，退化为 4 秒 tick 置顶")
+        except Exception:
+            traceback.print_exc()
+
+    def _uninstall_win_event_hook(self) -> None:
+        """卸载前台窗口钩子；句柄置 0，避免重复卸载。"""
+        try:
+            if self._win_event_hook:
+                _windows_api()["unhook"](self._win_event_hook)
+        except Exception:
+            traceback.print_exc()
+        self._win_event_hook = None
+
+    def _toggle_detail(self) -> None:
+        """点击挂件：打开/关闭详情窗口。"""
+        try:
+            if self._detail is not None and self._detail.isVisible():
+                self._close_detail()
+            else:
+                self._open_detail()
+        except Exception:
+            traceback.print_exc()
+
+    def _open_detail(self) -> None:
+        """打开详情窗口：优先挂件正上方，上方不够放下方，再不够就钳制进屏幕。"""
+        try:
+            if self._detail is None:
+                self._detail = DetailWindow(self._reader)
+            detail = self._detail
+            detail.refresh_content()
+            screen = self.screen() or QApplication.primaryScreen()
+            area = screen.availableGeometry()
+            w, h = detail.width(), detail.height()
+            x = self.x() + (self.width() - w) // 2
+            above = self.y() - h - 6
+            below = self.y() + self.height() + 6
+            if above >= area.top():
+                y = above
+            elif below + h <= area.bottom():
+                y = below
+            else:
+                y = max(area.top(), min(above, area.bottom() - h + 1))
+            x = max(area.left(), min(x, area.right() - w + 1))
+            detail.move(x, y)
+            detail.show()
+            detail.raise_()
+            detail.activateWindow()
+        except Exception:
+            traceback.print_exc()
+
+    def _close_detail(self) -> None:
+        """关闭详情窗口（挂件被隐藏/切模式/关窗时同步调用）。"""
+        try:
+            if self._detail is not None and self._detail.isVisible():
+                self._detail.close()
+        except Exception:
+            traceback.print_exc()
+
+    # ------------------------------------------------------------------ 任务栏吸附
+
+    def is_auto_dock_enabled(self) -> bool:
+        """供设置窗口读取：自动吸附开关是否开启。"""
+        return bool(AUTO_DOCK_ENABLED and self._auto_dock_enabled)
+
+    def is_docked(self) -> bool:
+        """供设置窗口读取：当前是否真的吸附在任务栏上。"""
+        return bool(self._docked)
+
+    def dock_status(self) -> str:
+        """供设置窗口读取：当前吸附状态文案（定位失败时会给出回退提示）。"""
+        return self.dock_status_text
+
+    def set_auto_dock(self, enabled: bool) -> None:
+        """设置窗口"自动吸附到任务栏"复选框的入口。
+
+        注意：这个状态不持久化——重启后一律回到默认勾选。
+        """
+        try:
+            if not AUTO_DOCK_ENABLED:
+                enabled = False
+            self._auto_dock_enabled = bool(enabled)
+            if self._auto_dock_enabled:
+                self._dock_timer.start()
+                self._dock_now()
+            else:
+                self._dock_timer.stop()
+                self._undock("自动吸附已关闭")
+        except Exception:
+            traceback.print_exc()
+
+    def _undock(self, reason: str) -> None:
+        """取消吸附：恢复可拖动/可缩放，并确保窗口可见。"""
+        try:
+            self._docked = False
+            self._dock_rect = None
+            self.dock_status_text = reason
+            if not self.isVisible():
+                self.show()
+            self.update()
+        except Exception:
+            traceback.print_exc()
+
+    def _switch_to_manual(self) -> None:
+        """用户一开始拖动，就自动切回手动模式，并把设置窗口的复选框取消勾选。
+
+        注意：这是需求推荐的交互（比"禁止拖动"更自然），
+        切换后不再自动定位，窗口停在用户放下的位置。
+        """
+        try:
+            if not self._auto_dock_enabled:
+                return
+            self._auto_dock_enabled = False
+            self._docked = False
+            self._dock_rect = None
+            self.dock_status_text = "已切换为手动拖动"
+            self._dock_timer.stop()
+            if self._settings is not None:
+                self._settings.sync_auto_dock(False)
+        except Exception:
+            traceback.print_exc()
+
+    def _dock_now(self) -> None:
+        """把挂件贴到任务栏左侧（垂直居中）；任何失败都保持可拖动、不崩溃。"""
+        if self._layout_mode != "widget":
+            return                      # 大面板模式不吸附
+        if not (AUTO_DOCK_ENABLED and self._auto_dock_enabled):
+            return
+        if self._docking:
+            return                      # 防重入：move/resize 可能再次触发 DPI 事件
+        self._docking = True
+        try:
+            self._update_widget_metrics()          # 先按任务栏高度刷新挂件尺寸
+            rect = _taskbar_rect()
+            if rect is None:
+                # 找不到任务栏：回退为可拖动的固定小条（仍是挂件形态，不切大面板）
+                self._docked = False
+                self.dock_status_text = "未找到任务栏，已回退为手动拖动"
+                self.resize(self._widget_w, self._widget_h)
+                self.update()
+                return
+
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                self._docked = False
+                self.dock_status_text = "未获取到屏幕信息，已回退为手动拖动"
+                return
+
+            # 任务栏矩形是物理像素，而 Qt 的 move/resize 用逻辑坐标。
+            # 任务栏通常在主屏，这里用主屏 DPI 比例换算；不做跨屏坐标推导，
+            # 避免混合 DPI 下把窗口算到看不见的地方。
+            dpr = max(1.0, float(screen.devicePixelRatio()))
+            tb_left, tb_top, tb_right, tb_bottom = rect
+            tb_left_l = tb_left / dpr
+            tb_top_l = tb_top / dpr
+            tb_h_l = (tb_bottom - tb_top) / dpr
+
+            x = tb_left_l + DOCK_OFFSET_X
+            start = _start_button_rect()
+            if start is not None and (start[0] / dpr) <= tb_left_l + 6:
+                # 开始按钮贴着任务栏左边缘：挂件必须停在它右侧，不能压住
+                x = start[2] / dpr + DOCK_OFFSET_X
+
+            w, h = self._widget_w, self._widget_h
+            y = int(round(tb_top_l + (tb_h_l - h) / 2.0))
+            geo = screen.geometry()
+            y = max(geo.top(), min(y, geo.bottom() - h + 1))
+            x = int(round(max(geo.left(), min(x, geo.right() - w))))
+
+            self.resize(w, h)
+            self.move(x, y)
+
+            self._docked = True
+            self._dock_rect = rect
+            self.dock_status_text = "已吸附到任务栏"
+            self._raise_above_taskbar()          # 置顶到任务栏之上
+            if not self.isVisible():
+                self.show()
+            self.update()
+        except Exception:
+            # 定位失败绝不能让程序崩溃：保持可拖动即可
+            self._docked = False
+            self.dock_status_text = "定位失败，已回退为手动拖动"
+            traceback.print_exc()
+        finally:
+            self._docking = False
+
+    def _on_dock_tick(self) -> None:
+        """每 4 秒一次：处理任务栏重建、分辨率变化、自动隐藏、全屏与层级。
+
+        注意：这是整个程序唯一新增的定时器，必须复用；paintEvent 里不做任何 Win32 调用。
+        """
+        try:
+            if self._layout_mode != "widget":
+                return
+            if not (AUTO_DOCK_ENABLED and self._auto_dock_enabled):
+                return
+            rect = _taskbar_rect()
+            if rect is None:
+                self._docked = False
+                self.dock_status_text = "未找到任务栏，已回退为手动拖动"
+                return
+            # 任务栏矩形变了（分辨率/DPI 变化、任务栏换边、Explorer 重建）→ 重新定位
+            if not self._docked or rect != self._dock_rect:
+                self._dock_now()
+            self._update_dock_visibility()
+            self._raise_above_taskbar()          # 兜底：钩子失效时也保持置顶
+        except Exception:
+            traceback.print_exc()
+
+    def _cursor_near_bottom(self) -> bool:
+        """鼠标是否停在屏幕底部（任务栏自动隐藏时用来判断是否唤出面板）。"""
+        try:
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                return True
+            geo = screen.geometry()
+            return QCursor.pos().y() >= geo.bottom() - 6
+        except Exception:
+            return True
+
+    def _update_dock_visibility(self) -> None:
+        """根据"任务栏自动隐藏"和"全屏程序"决定面板显隐。
+
+        注意：只做显隐，不移动窗口；隐藏期间 isVisible() 为 False，
+        恢复时走 show()，由 showEvent 恢复数据刷新。
+        """
+        try:
+            if self._layout_mode != "widget":
+                return
+            if not self._docked:
+                return
+            should_hide = False
+            if _foreground_fullscreen():
+                should_hide = True
+            if not should_hide and _taskbar_autohide() and not self._cursor_near_bottom():
+                # 任务栏自动隐藏且鼠标不在底部：面板一起隐藏，避免孤零零浮在底部
+                should_hide = True
+            if should_hide:
+                if self.isVisible():
+                    self.hide()
+            else:
+                if not self.isVisible():
+                    self.show()
+        except Exception:
+            traceback.print_exc()
+
+    def nativeEvent(self, event_type, message):
+        """监听 WM_DPICHANGED / WM_DISPLAYCHANGE / TaskbarCreated。
+
+        注意：只读取消息号，不做任何系统修改；全部异常在此吞掉，
+        因为 nativeEvent 抛异常会直接终止进程。用事件驱动替代高频轮询。
+        """
+        try:
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message in (WM_DPICHANGED, WM_DISPLAYCHANGE):
+                if AUTO_DOCK_ENABLED and self._auto_dock_enabled:
+                    self._dock_now()
+            elif self._taskbar_created_msg and msg.message == self._taskbar_created_msg:
+                # Explorer 重启：任务栏会重建，立即重新查找并定位
+                if AUTO_DOCK_ENABLED and self._auto_dock_enabled:
+                    self._docked = False
+                    self._dock_now()
+        except Exception:
+            traceback.print_exc()
+        # 注意：不要调用 super().nativeEvent(...) —— PyQt6 里基类实现会直接让进程崩溃
+        # （实测 0xC000041D：用户回调异常）。Qt 的约定是"未处理"返回 (False, 0)。
+        return False, 0
+
     def _draw_ring_item(self, painter: QPainter, item: ItemData, x: float, y: float, d: int) -> None:
         """绘制单个环：灰色底环 + 低对比度刻度线 + 彩色进度弧（或失败红叉）+ 中心名称。"""
         cx = x + d / 2.0
@@ -682,13 +1535,14 @@ class VitalPanel(QWidget):
             )
 
     def _draw_fail_cross(self, painter: QPainter, cx: float, cy: float,
-                         outer: float, thickness: float) -> None:
+                         outer: float, thickness: float, inner: float = None) -> None:
         """绘制失败红叉：只覆盖环形区域，绝不盖住中心文字（总需求第八条）。
 
         做法：把"外圆减去内圆"的路径设为裁剪区，再画两条对角线；
         这样红叉只会落在环带范围内，中心的项目名称始终可读。
+        inner 可按环大小缩放（挂件小环用更小的内洞，否则红叉会被裁没）。
         """
-        cross_inner = max(14.0, outer * 0.5)          # 内圈半径：保证与中心文字留出安全距离
+        cross_inner = inner if inner is not None else max(14.0, outer * 0.5)   # 内圈半径
         clip = QPainterPath()
         clip.addEllipse(QPointF(cx, cy), outer, outer)
         hole = QPainterPath()
@@ -821,8 +1675,10 @@ class VitalPanel(QWidget):
             self._press_pos = pos
             self._moved = False
             self._pending_action = None
-            # 命中判定与 _draw_resize_hint() 共用同一个矩形，保证"看得见"就"点得中"
-            if self._resize_hot_rect().contains(pos):
+            # 命中判定与 _draw_resize_hint() 共用同一个矩形，保证"看得见"就"点得中"。
+            # 只有大面板模式才有缩放手柄；挂件模式宽度固定，且吸附时也不允许缩放。
+            if (self._layout_mode == "panel" and not self._docked
+                    and self._resize_hot_rect().contains(pos)):
                 self._resizing = True
                 self._resize_start_x = event.globalPosition().x()
                 self._resize_start_w = self.width()
@@ -842,13 +1698,22 @@ class VitalPanel(QWidget):
             # 注意只在没有按住鼠标时改光标——否则拖动途中会不停 unsetCursor，
             # 让斜向双箭头半路闪回默认箭头。这里不 return，继续走下面的缩放/拖动逻辑。
             if not self._resizing and not self._dragging:
-                if self._gear_rect().contains(event.position()):
-                    # 齿轮是"按钮"，用小手光标提示可点击（优先级高于缩放手柄的斜箭头）
-                    self.setCursor(Qt.CursorShape.PointingHandCursor)
-                elif self._resize_hot_rect().contains(event.position()):
-                    self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                if self._layout_mode == "panel":
+                    if self._gear_rect().contains(event.position()):
+                        # 齿轮是"按钮"，用小手光标提示可点击（优先级高于缩放手柄的斜箭头）
+                        self.setCursor(Qt.CursorShape.PointingHandCursor)
+                    elif not self._docked and self._resize_hot_rect().contains(event.position()):
+                        # 吸附状态下不提示缩放，避免用户以为能拖宽度
+                        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                    else:
+                        self.unsetCursor()
                 else:
+                    # 挂件模式没有手柄/齿轮，统一恢复默认光标
                     self.unsetCursor()
+            # 挂件已吸附时不允许拖动（位置由定位逻辑决定）；但仍要能"点击"，
+            # 所以这里直接返回、不把本次移动算作拖动，松开时仍会触发点击动作。
+            if self._layout_mode == "widget" and self._docked:
+                return
             if self._resizing:
                 delta = event.globalPosition().x() - self._resize_start_x
                 new_w = self._clamp_width(int(self._resize_start_w + delta))
@@ -863,6 +1728,9 @@ class VitalPanel(QWidget):
                 moved = event.position() - self._press_pos
                 if abs(moved.x()) + abs(moved.y()) > self.CLICK_SLOP:
                     self._moved = True        # 位移超过阈值：判定为拖动，本次不再执行点击动作
+                    # 挂件未吸附（定位失败回退）或大面板模式时，拖动即切回手动模式
+                    if AUTO_DOCK_ENABLED and self._auto_dock_enabled:
+                        self._switch_to_manual()
                     if DEBUG_LOG:
                         print(f"[drag] 开始 pos=({self.x()},{self.y()}) "
                               f"dpr={self.devicePixelRatioF():.2f}")
@@ -892,9 +1760,13 @@ class VitalPanel(QWidget):
         """
         try:
             rect = QRectF(target.x(), target.y(), self.width(), self.height())
+            # 阈值不能死写 60×60：挂件只有 44 高，永远达不到 60，会导致完全拖不动。
+            # 这里按窗口自身尺寸取阈值（最多 60），保证"至少留一部分可见"对小挂件也成立。
+            need_w = min(60, max(20, self.width()))
+            need_h = min(60, max(20, self.height()))
             for s in QApplication.screens():
                 inter = QRectF(s.availableGeometry()).intersected(rect)
-                if inter.width() >= 60 and inter.height() >= 60:
+                if inter.width() >= need_w and inter.height() >= need_h:
                     return True
             return False
         except Exception:
@@ -929,12 +1801,18 @@ class VitalPanel(QWidget):
     def _hit_action(self, pos):
         """判断按下的位置落在哪个可点击区域，返回动作名；不属于任何区域则返回 None。
 
-        可点击区域有三类：
-        0) 右下角小齿轮 → 打开"设置与调试"窗口（不参与环形/文字切换）；
-        1) 五环（环形模式）或五行列表（文字模式）→ 切换显示模式；
-        2) 下方"开机时长""系统版本"两行 → 折叠或展开该行内容。
-        注意：齿轮判断必须放在最前面，保证点齿轮永远不会误触发模式切换。
+        挂件模式：
+        - 命中设置环（槽 4）→ "settings"，直接打开设置窗口；
+        - 命中其它数据环或环间缝隙 → "detail"，弹详情窗口。
+        大面板模式：
+        - 齿轮 → "settings"；环/文字列表 → "mode"；两个文本行 → "boot"/"os"。
         """
+        if self._layout_mode == "widget":
+            for idx, (x, y, d) in enumerate(self._widget_ring_positions()):
+                if x <= pos.x() <= x + d:
+                    return "settings" if self._slot_keys[idx] == "settings" else "detail"
+            return "detail"           # 环间缝隙也按"弹详情"处理（需求指定）
+
         width = self.width()
         if self._gear_rect().contains(QPointF(pos.x(), pos.y())):
             return "settings"
@@ -964,6 +1842,9 @@ class VitalPanel(QWidget):
         if action == "settings":
             self._open_settings()
             return
+        if action == "detail":
+            self._toggle_detail()       # 挂件模式：点击数据环/缝隙切换详情窗口
+            return
         if action == "mode":
             self._list_mode = not self._list_mode
         elif action == "boot":
@@ -990,6 +1871,7 @@ class VitalPanel(QWidget):
                 self._settings = SettingsWindow(
                     self._reader, self, APP_VERSION,
                     repo_url=APP_REPO_URL, author=APP_AUTHOR,
+                    auto_dock_available=bool(AUTO_DOCK_ENABLED),
                 )
             self._settings.show()
             self._settings.raise_()
@@ -1003,12 +1885,104 @@ class VitalPanel(QWidget):
         注意：窗口无边框、不进任务栏、且设置了不接受焦点，
         所以既没有关闭按钮、Alt+F4 也对它无效，必须提供右键菜单才能退出。
         菜单对象在 __init__ 里只创建一次并复用，避免每次右键都新建一个子对象。
+        挂件模式用「设置… / 退出」两项菜单；大面板模式仍只有「退出」。
         """
         try:
-            self._menu.exec(event.globalPos())
+            menu = self._widget_menu if self._layout_mode == "widget" else self._menu
+            menu.exec(event.globalPos())
         except Exception:
             # 同上：事件处理函数异常不能让它把进程带崩
             traceback.print_exc()
+
+
+class DetailWindow(QWidget):
+    """挂件模式的详情窗口：7 行只读信息（含电池），点击任意位置或 Esc 关闭。
+
+    注意：
+    - 本窗口不创建任何定时器，内容在每次打开时取一次快照，避免额外占用；
+    - 即使挂件上没显示电池，详情里也固定显示完整五项。
+    """
+
+    WIDTH = 200
+    HEIGHT = 190
+
+    def __init__(self, reader) -> None:
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self._reader = reader
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        # 需要接收 Esc，所以给一个能获取焦点的策略（打开时由主窗口 activateWindow）
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+
+    def refresh_content(self) -> None:
+        """打开前刷新一次（数据由主窗口的定时器已读好，这里只触发重绘）。"""
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        """画圆角深色背景 + 7 行信息 + 右下角版本号。"""
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            painter.setBrush(QColor(20, 22, 26, 235))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(QRectF(self.rect()), 10, 10)
+
+            font = QFont()
+            font.setPointSize(9)
+            painter.setFont(font)
+            y = 10.0
+            line_h = 21.0
+            for item in self._reader.items:
+                if item.is_ok:
+                    painter.setPen(QColor(200, 205, 212))
+                    text = f"{item.name}：{int(round(item.value or 0.0))}%"
+                else:
+                    painter.setPen(COLOR_RED)
+                    text = f"{item.name}：{item.reason or '读取失败'}"
+                painter.drawText(
+                    QRectF(12, y, self.width() - 24, line_h),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text,
+                )
+                y += line_h
+            painter.setPen(QColor(200, 205, 212))
+            for text in (self._reader.boot_text, self._reader.os_text):
+                painter.drawText(
+                    QRectF(12, y, self.width() - 24, line_h),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text,
+                )
+                y += line_h
+
+            font.setPointSize(7)
+            painter.setFont(font)
+            painter.setPen(QColor(140, 145, 155))
+            painter.drawText(
+                QRectF(12, self.height() - 18, self.width() - 24, 12),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                f"版本 {APP_VERSION}",
+            )
+        except Exception:
+            traceback.print_exc()
+        finally:
+            painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        """点击详情任意位置即关闭。"""
+        self.close()
+
+    def keyPressEvent(self, event) -> None:
+        """Esc 关闭；其它按键交给基类。"""
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
 
 
 def main() -> int:
