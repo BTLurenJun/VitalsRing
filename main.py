@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""VitalsRing（环脉）主窗口 —— 第一阶段第 2 轮。
+"""VitalsRing（环脉）主窗口 —— 第一阶段第 3 轮。
 
-已完成范围：无边框置顶小窗 + 五个 QPainter 自绘环 + 两个文本行 + 失败红叉 + 版本号（第 1 轮），
-            点击环形/文字列表互切 + 两个文本行折叠展开（第 2 轮）。
-本轮不含：设置窗口/调试模式/检测开关（第 3 轮），任务栏吸附定位（第二阶段）。
+已完成范围：无边框置顶小窗 + 五个 QPainter 自绘环 + 两个文本行 + 失败红叉 + 版本号（第 1 轮）；
+            点击环形/文字列表互切 + 两个文本行折叠展开（第 2 轮）；
+            设置窗口 + 调试模式 + 五项调试值 + 五项检测开关 + GitHub 预留按钮（第 3 轮）。
+本轮不含：任务栏吸附定位（第二阶段）。
 安全边界：仅读取并显示系统信息，不修改任何系统设置、不写注册表、不删除文件。
 """
 from __future__ import annotations
@@ -21,10 +22,14 @@ from readers import ItemData, SystemReader
 from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
-# 第 1 轮 0.10.01.xx 已验收；第 2 轮起始 0.10.02.01，本轮内每次按反馈修改第四位递增
-APP_VERSION = "0.10.03.02"
+# 第 3 轮起始 0.10.03.01，本轮内每次按反馈修改第四位递增
+APP_VERSION = "0.10.03.03"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
+
+# 调试日志总开关：发布版保持 False，避免带控制台的 python.exe 每次刷新都刷屏。
+# 排查"窗口闪一下消失"这类问题时，临时改成 True 即可看到拖动/显示/隐藏的轨迹。
+DEBUG_LOG = False
 
 # 环形配色（总需求第七条）：<60% 绿，60%~85% 黄，>85% 红；电池 <20% 红，充电中可用绿或蓝
 COLOR_GREEN = QColor("#43A047")
@@ -234,7 +239,8 @@ class VitalPanel(QWidget):
 
     def hideEvent(self, event) -> None:
         """窗口隐藏时暂停定时刷新，避免看不见时仍白耗 CPU/内存（总需求第三条）。"""
-        print("[window] hideEvent")          # 诊断输出：排查"窗口闪一下消失"时看它是否被触发
+        if DEBUG_LOG:
+            print("[window] hideEvent")
         self._timer.stop()
         super().hideEvent(event)
 
@@ -245,19 +251,28 @@ class VitalPanel(QWidget):
         这样首次刷新也走同一套 try/except 兜底。
         """
         super().showEvent(event)
-        print("[window] showEvent")           # 诊断输出：与 hideEvent 配对，用于确认窗口是否被主动隐藏
+        if DEBUG_LOG:
+            print("[window] showEvent")
         self._on_refresh_tick()
         # 调试模式期间不启动定时器，否则真实读数会把调试值冲掉
         if not self._reader.debug_active and not self._timer.isActive():
             self._timer.start()
 
     def changeEvent(self, event) -> None:
-        """最小化时同样暂停刷新；从最小化恢复时再启动定时器。"""
-        if event.type() == QEvent.Type.WindowStateChange:
-            if self.isMinimized():
-                self._timer.stop()
-            elif not self._timer.isActive() and self.isVisible():
-                self._timer.start()
+        """最小化时同样暂停刷新；从最小化恢复时再启动定时器。
+
+        注意：恢复条件要带上"未在调试模式"，与 showEvent 保持一致——
+        调试期间真实读取是被暂停的，定时器若空转只会白耗 CPU。
+        """
+        try:
+            if event.type() == QEvent.Type.WindowStateChange:
+                if self.isMinimized():
+                    self._timer.stop()
+                elif (not self._reader.debug_active and not self._timer.isActive()
+                      and self.isVisible()):
+                    self._timer.start()
+        except Exception:
+            traceback.print_exc()
         super().changeEvent(event)
 
     def closeEvent(self, event) -> None:
@@ -274,17 +289,20 @@ class VitalPanel(QWidget):
         """尺寸变化保险：窗口被任何路径拉得比 _max_width 还宽时，强制收回来。
 
         注意：这里必须用防重入标志——resize() 会再次触发 resizeEvent，
-        不加标志就会无限递归调用自己。
+        不加标志就会无限递归调用自己。super() 放在 try 外，避免异常时漏掉基类处理。
         """
         super().resizeEvent(event)
-        if not self._fixing_size and self.width() > self._max_width:
-            # 防止任何路径把窗口拉成横跨屏幕的长条；尺寸同样走 _clamp_width()
-            fixed_w = self._clamp_width(self._max_width)
-            self._fixing_size = True
-            try:
-                self.resize(fixed_w, self.heightForWidth(fixed_w))
-            finally:
-                self._fixing_size = False
+        try:
+            if not self._fixing_size and self.width() > self._max_width:
+                # 防止任何路径把窗口拉成横跨屏幕的长条；尺寸同样走 _clamp_width()
+                fixed_w = self._clamp_width(self._max_width)
+                self._fixing_size = True
+                try:
+                    self.resize(fixed_w, self.heightForWidth(fixed_w))
+                finally:
+                    self._fixing_size = False
+        except Exception:
+            traceback.print_exc()
 
     def _screen_for_window(self):
         """返回"窗口中心所在"的那块屏幕，用于尺寸变化后的位置钳制。
@@ -696,9 +714,9 @@ class VitalPanel(QWidget):
         因此只记录"候选动作"，等到松开时再判断这次到底是点击还是拖动。
         """
         try:
-            # 诊断输出：临时保留，用于排查混合 DPI 拖动问题，问题解决后可删
-            print(f"[press] pos=({event.position().x():.0f},{event.position().y():.0f}) "
-                  f"dpr={self.devicePixelRatioF():.2f}")
+            if DEBUG_LOG:
+                print(f"[press] pos=({event.position().x():.0f},{event.position().y():.0f}) "
+                      f"dpr={self.devicePixelRatioF():.2f}")
             if event.button() != Qt.MouseButton.LeftButton:
                 return
             pos = event.position()
@@ -747,9 +765,9 @@ class VitalPanel(QWidget):
                 moved = event.position() - self._press_pos
                 if abs(moved.x()) + abs(moved.y()) > self.CLICK_SLOP:
                     self._moved = True        # 位移超过阈值：判定为拖动，本次不再执行点击动作
-                    # 诊断输出：临时保留，问题解决后可删
-                    print(f"[drag] 开始 pos=({self.x()},{self.y()}) "
-                          f"dpr={self.devicePixelRatioF():.2f}")
+                    if DEBUG_LOG:
+                        print(f"[drag] 开始 pos=({self.x()},{self.y()}) "
+                              f"dpr={self.devicePixelRatioF():.2f}")
             if not self._moved or self._last_global is None:
                 return
             # 必须用增量位移，而不是"固定 offset + 绝对定位"：
@@ -757,11 +775,33 @@ class VitalPanel(QWidget):
             # 绝对定位会算出极远坐标、导致窗口跳飞（现象就是闪一下后消失）。
             cur = event.globalPosition().toPoint()
             delta = cur - self._last_global
-            self._last_global = cur
-            self.move(self.pos() + delta)
+            self._last_global = cur          # 先更新基准：即使这一帧被丢弃，位移也不会累积成下一次跳跃
+            target = self.pos() + delta
+            # 混合 DPI 下这里只判断"是否允许这一帧位移"，不搬窗口、不做坐标换算，
+            # 避免再次出现跨屏坐标错乱；判断标准是目标位置仍与某块屏幕有足够交集。
+            if self._target_still_visible(target):
+                self.move(target)
         except Exception:
             # PyQt6 里事件处理函数抛未捕获异常会直接终止进程，表现就是"窗口闪一下消失"
             traceback.print_exc()
+
+    def _target_still_visible(self, target) -> bool:
+        """目标位置是否仍与某块屏幕有 ≥60×60 的交集（逐屏判断，不用并集包围盒，不做坐标换算）。
+
+        注意：不能用"所有屏幕的并集包围盒"——并集里可能包含不属于任何屏幕的空洞；
+        也不能在这里调用 move()/换算坐标，混合 DPI 下那样会把窗口搬到看不见的位置。
+        这里只回答一个问题：这一帧的位移允不允许应用。
+        """
+        try:
+            rect = QRectF(target.x(), target.y(), self.width(), self.height())
+            for s in QApplication.screens():
+                inter = QRectF(s.availableGeometry()).intersected(rect)
+                if inter.width() >= 60 and inter.height() >= 60:
+                    return True
+            return False
+        except Exception:
+            traceback.print_exc()
+            return True       # 判断本身出错时放行，宁可让用户能拖动，也不要卡死窗口
 
     def mouseReleaseEvent(self, event) -> None:
         """松开左键：若全程没有移动，就按一次"点击"处理，否则只结束拖动/缩放。"""
@@ -773,13 +813,14 @@ class VitalPanel(QWidget):
                 self._apply_action(self._pending_action)
             if self._dragging:
                 # 混合 DPI 下逻辑坐标与物理坐标不一致，坐标救援会把窗口搬到看不见的位置，
-                # 所以这里只打日志、不再调用 _ensure_reachable()；增量拖动已保证不会跳飞。
-                # 诊断输出：临时保留，问题解决后可删。
-                screen = self.screen()
-                print(f"[drag] 结束 pos=({self.x()},{self.y()}) "
-                      f"size={self.width()}x{self.height()} "
-                      f"screen={screen.name() if screen else 'None'} "
-                      f"dpr={self.devicePixelRatioF():.2f}")
+                # 所以这里不做坐标救援；拖动途中已用 _target_still_visible() 逐帧把关，
+                # 保证窗口始终留有足够可见区域。
+                if DEBUG_LOG:
+                    screen = self.screen()
+                    print(f"[drag] 结束 pos=({self.x()},{self.y()}) "
+                          f"size={self.width()}x{self.height()} "
+                          f"screen={screen.name() if screen else 'None'} "
+                          f"dpr={self.devicePixelRatioF():.2f}")
             self._dragging = False
             self._resizing = False
             self._pending_action = None

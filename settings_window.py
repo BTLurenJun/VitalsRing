@@ -196,23 +196,37 @@ class SettingsWindow(QDialog):
             self._reader.debug_values.clear()
             self._reader.apply_state()
             self._panel.update()
+            # 防止历史遗留的"调试已关但主窗口定时器没恢复"导致主窗口不刷新
+            self._panel.resume_refresh()
+        except Exception:
+            traceback.print_exc()
+
+    def hideEvent(self, event) -> None:
+        """任何隐藏路径都会走到这里，统一复位，避免漏掉某条路径。
+
+        注意：X 关闭、Esc、reject()、直接 hide() 最终都会触发隐藏事件，
+        因此复位主要在这里兜底；closeEvent / reject 里的调用保留也无害（幂等）。
+        """
+        super().hideEvent(event)
+        try:
+            self._reset_on_close()
         except Exception:
             traceback.print_exc()
 
     def closeEvent(self, event) -> None:
-        """点 X 关闭：必须先复位调试状态，再交给基类处理。"""
+        """点 X 关闭：复位调试状态（hideEvent 也会兜底复位一次，幂等）。"""
         self._reset_on_close()
         super().closeEvent(event)
 
     def reject(self) -> None:
-        """Esc 走 reject()，不会触发 closeEvent，因此这里也要复位一次。"""
+        """Esc 走 reject()：这里先复位一次，隐藏后 hideEvent 还会再兜底一次。"""
         self._reset_on_close()
         super().reject()
 
     def _reset_on_close(self) -> None:
         """关闭窗口时复位：关调试模式、子控件置灰、主窗口立即恢复真实数据刷新。
 
-        注意：本方法是幂等的——closeEvent 与 reject 都可能调用它，
+        注意：本方法是幂等的——closeEvent / reject / hideEvent 都可能调用它，
         重复执行不会产生副作用（都只是关开关、清调试值、恢复刷新）。
         """
         try:
