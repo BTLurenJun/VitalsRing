@@ -28,8 +28,8 @@ from PyQt6.QtWidgets import (
 )
 
 # 预留：配置成真实仓库地址后，"打开 GitHub 仓库"按钮才会真正跳转。
-# 为空时点击只提示"尚未配置"，不打开任何网页、也不崩溃。
-GITHUB_REPO_URL = ""
+# 注意：仓库地址统一由 main.py 的 APP_REPO_URL 提供并通过构造函数传入，
+# 这里不再保留第二个 GITHUB_REPO_URL 常量，避免两处地址不一致。
 
 
 class SettingsWindow(QDialog):
@@ -39,11 +39,14 @@ class SettingsWindow(QDialog):
     所以复位逻辑写成幂等的 _reset_on_close()，closeEvent 和 reject() 都会调用。
     """
 
-    def __init__(self, reader, panel, app_version: str) -> None:
+    def __init__(self, reader, panel, app_version: str,
+                 repo_url: str = "", author: str = "") -> None:
         super().__init__(panel)
         self._reader = reader
         self._panel = panel
         self._app_version = app_version
+        self._repo_url = repo_url
+        self._author = author
 
         self.setWindowTitle("设置与调试")
         self.setMinimumWidth(460)
@@ -123,10 +126,21 @@ class SettingsWindow(QDialog):
         detect_row.addStretch(1)
         root.addWidget(detect_box)
 
-        # ---- GitHub 预留按钮 ----
+        # ---- GitHub 按钮（打开 APP_REPO_URL 指向的真实仓库地址）----
         self._github_btn = QPushButton("打开 GitHub 仓库")
         self._github_btn.clicked.connect(self._on_github)
         root.addWidget(self._github_btn)
+
+        # ---- 关于（只读）：作者与仓库地址，字号比正文小一号、颜色 #8C919B ----
+        about_box = QGroupBox("关于")
+        about_layout = QVBoxLayout(about_box)
+        self._author_label = QLabel(f"作者：@{self._author}")
+        self._repo_label = QLabel(f"仓库：{self._repo_url}")
+        for label in (self._author_label, self._repo_label):
+            label.setStyleSheet("color: #8C919B; font-size: 11px;")
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            about_layout.addWidget(label)
+        root.addWidget(about_box)
 
         # ---- 版本号（与主窗口显示同一四段版本号）----
         self._version_label = QLabel(f"版本 {self._app_version}")
@@ -269,9 +283,9 @@ class SettingsWindow(QDialog):
     def _on_github(self) -> None:
         """打开 GitHub 仓库；地址为空时只提示，不跳转、不崩溃。"""
         try:
-            if not GITHUB_REPO_URL.strip():
+            if not (self._repo_url or "").strip():
                 QMessageBox.information(self, "提示", "GitHub 仓库尚未配置")
                 return
-            QDesktopServices.openUrl(QUrl(GITHUB_REPO_URL))
+            QDesktopServices.openUrl(QUrl(self._repo_url))
         except Exception:
             traceback.print_exc()

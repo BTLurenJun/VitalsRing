@@ -22,7 +22,9 @@ from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
 # 第 1 轮 0.10.01.xx 已验收；第 2 轮起始 0.10.02.01，本轮内每次按反馈修改第四位递增
-APP_VERSION = "0.10.03.01"
+APP_VERSION = "0.10.03.02"
+APP_AUTHOR = "BTLurenJun"                                    # 作者署名
+APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
 # 环形配色（总需求第七条）：<60% 绿，60%~85% 黄，>85% 红；电池 <20% 红，充电中可用绿或蓝
 COLOR_GREEN = QColor("#43A047")
@@ -845,7 +847,11 @@ class VitalPanel(QWidget):
         """
         try:
             if self._settings is None:
-                self._settings = SettingsWindow(self._reader, self, APP_VERSION)
+                # 作者与仓库地址统一来自本文件顶部常量，避免在设置窗口里再定义一份
+                self._settings = SettingsWindow(
+                    self._reader, self, APP_VERSION,
+                    repo_url=APP_REPO_URL, author=APP_AUTHOR,
+                )
             self._settings.show()
             self._settings.raise_()
             self._settings.activateWindow()
