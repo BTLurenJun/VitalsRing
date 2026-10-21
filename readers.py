@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """VitalsRing（环脉）数据读取层。
 
 职责：只读采集 CPU / 内存 / GPU / C 盘 / 电池 / 开机时长 / 系统版本。
@@ -9,11 +9,13 @@
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 import sys
 import time
 import warnings
+from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Optional
 
@@ -25,6 +27,75 @@ STATUS_FAILED = "failed"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_NO_BATTERY = "no_battery"
 STATUS_DISABLED = "disabled"  # 第 3 轮"检测已关闭"使用，本轮先预留，避免后续重构绘制逻辑
+
+# ---- 第 7 轮：磁盘类型探测（SSD / HDD）只读 Win32 调用 ----
+# 约定：所有函数声明 argtypes / restype，句柄在 finally 中关闭；
+#       探测只在构造枚举阶段执行一次，任何失败一律回退 "ssd"。
+IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+STORAGE_DEVICE_SEEK_PENALTY_PROPERTY = 7
+# 注意：打开卷句柄只用于查询属性，desired access 必须用 0。
+# 实测 GENERIC_READ 在非管理员权限下返回 ERROR_ACCESS_DENIED(5)，
+# 而 access=0 可以正常打开并发送 DeviceIoControl，仍然只读、不写盘。
+VOLUME_QUERY_ACCESS = 0
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+OPEN_EXISTING = 3
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _StoragePropertyQuery(ctypes.Structure):
+    """DeviceIoControl 查询磁盘属性用的 STORAGE_PROPERTY_QUERY。"""
+
+    _fields_ = [
+        ("PropertyId", wintypes.DWORD),
+        ("QueryType", wintypes.DWORD),
+        ("AdditionalParameters", wintypes.BYTE * 1),
+    ]
+
+
+class _DeviceSeekPenaltyDescriptor(ctypes.Structure):
+    """DEVICE_SEEK_PENALTY_DESCRIPTOR：IncursSeekPenalty=False 即 SSD。"""
+
+    _fields_ = [
+        ("Version", wintypes.DWORD),
+        ("Size", wintypes.DWORD),
+        ("IncursSeekPenalty", wintypes.BOOLEAN),
+    ]
+
+
+_DISK_API = None
+
+
+def _disk_api():
+    """建立并缓存 CreateFileW / DeviceIoControl / CloseHandle 的函数原型。
+
+    注意：64 位下句柄若未声明 argtypes 会被截断甚至 OverflowError，
+    因此这里必须显式声明；本函数只读磁盘属性，不修改任何系统设置。
+    """
+    global _DISK_API
+    if _DISK_API is not None:
+        return _DISK_API
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    device_io = kernel32.DeviceIoControl
+    device_io.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p,
+                          wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                          ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    device_io.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    _DISK_API = {
+        "create_file": create_file,
+        "device_io": device_io,
+        "close_handle": close_handle,
+    }
+    return _DISK_API
 
 
 @dataclass
@@ -40,6 +111,7 @@ class ItemData:
     status: str = STATUS_OK                 # 见上方状态常量
     reason: Optional[str] = None            # 失败原因文案：读取失败 / 不支持 / 无电池 / 检测已关闭
     charging: bool = False                  # 仅电池使用：是否正在充电
+    disk_type: str = ""                     # 仅磁盘使用：ssd / hdd（探测失败默认 ssd）
 
     @property
     def is_ok(self) -> bool:
@@ -209,6 +281,12 @@ class SystemReader:
         # 磁盘枚举只在构造时做一次并缓存：psutil.disk_partitions() 要枚举卷，
         # 若放进每 2 秒的 refresh() 会明显抬高 CPU；刷新时只对缓存里的挂载点调 disk_usage()。
         self._disk_partitions = self._enumerate_fixed_partitions()
+        # 第 7 轮：磁盘类型（SSD/HDD）只在枚举阶段探测一次并缓存。
+        # 绝不放进 2 秒 refresh，避免 DeviceIoControl 阻塞 GUI 线程。
+        self._disk_types = {}
+        for key, _label, mount in self._disk_partitions:
+            letter = self._drive_letter(mount)
+            self._disk_types[key] = self._detect_disk_type(letter) if letter else "ssd"
         # disk_total 聚合所有固定磁盘；其余固定盘按盘符单独成项（disk_d / disk_e ...）
         # 名称用"总盘"而不是"总盘"：挂件小环只有 34px，三字名容易溢出环外
         self.extra_items = [ItemData("disk_total", "总盘")]
@@ -218,6 +296,13 @@ class SystemReader:
                 continue
             self.extra_items.append(ItemData(key, label))
             seen_keys.add(key)
+        # 把探测结果写入 ItemData；总盘不是单块物理盘，不设置 disk_type
+        for item in self.items:
+            if item.key.startswith("disk_"):
+                item.disk_type = self._disk_types.get(item.key, "ssd")
+        for item in self.extra_items:
+            if item.key.startswith("disk_") and item.key != "disk_total":
+                item.disk_type = self._disk_types.get(item.key, "ssd")
         # 槽位 key -> ItemData（五项固定 + 总盘 + 动态磁盘）；gear 由界面层单独绘制
         self.slot_items = dict(self._items_by_key)
         for item in self.extra_items:
@@ -256,6 +341,53 @@ class SystemReader:
         except Exception:
             pass
         return None
+
+    def _detect_disk_type(self, drive_letter) -> str:
+        """探测盘符是 SSD 还是 HDD；任何异常/失败一律返回 "ssd"。
+
+        实现（只读 Win32，仅作用于本进程打开的卷句柄）：
+        - CreateFileW 打开 \\\\.\\X:；
+        - DeviceIoControl 发送 IOCTL_STORAGE_QUERY_PROPERTY，
+          查询 StorageDeviceSeekPenaltyProperty；
+        - IncursSeekPenalty=False → SSD，True → HDD；
+        - 句柄在 finally 中关闭；所有 Win32 原型都声明 argtypes/restype；
+        - 只在构造枚举阶段调用一次，绝不放进 2 秒刷新。
+        """
+        handle = None
+        try:
+            letter = str(drive_letter or "").strip().rstrip(":").upper()
+            if len(letter) != 1 or not letter.isalpha():
+                return "ssd"
+            api = _disk_api()
+            path = f"\\\\.\\{letter}:"
+            handle = api["create_file"](
+                path, VOLUME_QUERY_ACCESS, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+            if not handle or handle == INVALID_HANDLE_VALUE:
+                return "ssd"
+            query = _StoragePropertyQuery()
+            query.PropertyId = STORAGE_DEVICE_SEEK_PENALTY_PROPERTY
+            query.QueryType = 0                 # PropertyStandardQuery
+            desc = _DeviceSeekPenaltyDescriptor()
+            returned = wintypes.DWORD(0)
+            ok = api["device_io"](
+                handle, IOCTL_STORAGE_QUERY_PROPERTY,
+                ctypes.byref(query), ctypes.sizeof(query),
+                ctypes.byref(desc), ctypes.sizeof(desc),
+                ctypes.byref(returned), None)
+            # 至少要拿到 Version + Size + IncursSeekPenalty 三个字段（9 字节）
+            if not ok or returned.value < 9:
+                return "ssd"
+            return "hdd" if bool(desc.IncursSeekPenalty) else "ssd"
+        except Exception:
+            # 死命令：任何异常、权限不足、驱动不支持都默认 SSD，绝不影响界面
+            return "ssd"
+        finally:
+            if handle and handle != INVALID_HANDLE_VALUE:
+                try:
+                    _disk_api()["close_handle"](handle)
+                except Exception:
+                    pass
 
     def _enumerate_fixed_partitions(self):
         """枚举固定磁盘并缓存，返回 [(key, 显示名, 挂载点)]。
@@ -415,6 +547,10 @@ class SystemReader:
             item = self.slot_items.get(key)
             if item is None:
                 continue
+            # 刷新时只做一次廉价兜底赋值：类型已在枚举阶段探测并缓存，
+            # 绝不在 2 秒刷新里重复调用 DeviceIoControl。
+            if not item.disk_type:
+                item.disk_type = self._disk_types.get(key, "ssd")
             if key == "disk_c":
                 seen_c = True
             try:
@@ -431,7 +567,10 @@ class SystemReader:
         if not seen_c:
             try:
                 usage = psutil.disk_usage("C:\\")
-                self._set(self._items_by_key["disk_c"], float(usage.percent), STATUS_OK)
+                c_item = self._items_by_key["disk_c"]
+                self._set(c_item, float(usage.percent), STATUS_OK)
+                if not c_item.disk_type:
+                    c_item.disk_type = self._disk_types.get("disk_c", "ssd")
                 total_bytes += float(usage.total)
                 used_bytes += float(usage.used)
                 any_ok = True

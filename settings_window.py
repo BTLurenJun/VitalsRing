@@ -11,19 +11,24 @@
 - 第二阶段：补充"自动吸附到任务栏"开关与定位状态提示。
 - 第 5 轮：设置锁（JSON 持久化）、恢复默认设置淡入淡出动画、动态磁盘槽位。
 - 第 6 轮：五槽位全可配、调试项适配动态磁盘、两个恢复按钮加图标、制作人员署名。
+- 第 7 轮：外观分组新增「使用拟物化图标」开关，与刻度开关一样受设置锁控制。
+- 第 7 轮完全体：新增「图标风格」下拉（多色拟物 / 单色线条），受锁持久化。
 """
 from __future__ import annotations
 
 import traceback
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtCore import (
+    QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRect, QRectF, QSize,
+    Qt, QTimer, QUrl, pyqtProperty, pyqtSignal,
+)
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QCheckBox,
     QComboBox,
     QDialog,
+    QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
     QGroupBox,
@@ -36,6 +41,7 @@ from PyQt6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStyle,
+    QStyleOptionSlider,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -45,6 +51,344 @@ from PyQt6.QtWidgets import (
 # 注意：仓库地址统一由 main.py 的 APP_REPO_URL 提供并通过构造函数传入，
 # 这里不再保留第二个 GITHUB_REPO_URL 常量，避免两处地址不一致。
 
+
+# 第 7 轮定稿：现代深色 QSS。QSS 不支持 box-shadow，
+# 卡片阴影统一用 QGraphicsDropShadowEffect 实现（见 _apply_card_shadow）。
+SETTINGS_QSS = """
+QDialog { background-color: #0d1117; }
+QScrollArea { background: transparent; border: none; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+#settingsContent { background-color: #0d1117; }
+#debugRowsCard {
+    background-color: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 10px;
+}
+QGroupBox {
+    background-color: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 10px;
+    margin-top: 10px;
+    padding: 10px 10px 8px 10px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 14px;
+    padding: 0 6px;
+    color: #e6edf3;
+    background-color: #161b22;
+}
+QLabel { color: #c9d1d9; }
+QComboBox {
+    background-color: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 5px 26px 5px 10px;
+    color: #e6edf3;
+    min-height: 22px;
+}
+QComboBox:hover { border-color: #58a6ff; }
+QComboBox:disabled { color: #6e7681; border-color: #21262d; }
+QComboBox::drop-down { border: none; width: 24px; }
+QComboBox::down-arrow { image: none; }
+QComboBox QAbstractItemView {
+    background-color: #161b22;
+    border: 1px solid #30363d;
+    selection-background-color: #1f6feb;
+    color: #e6edf3;
+    outline: 0;
+}
+QPushButton {
+    background-color: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 7px 14px;
+    color: #e6edf3;
+}
+QPushButton:hover { background-color: #30363d; border-color: #8b949e; }
+QPushButton:pressed { background-color: #161b22; }
+QPushButton:disabled { color: #6e7681; background-color: #161b22; border-color: #21262d; }
+QToolButton {
+    background-color: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 4px 8px;
+    font-size: 16px;
+}
+QToolButton:hover { background-color: #30363d; }
+QRadioButton { color: #c9d1d9; spacing: 8px; }
+QRadioButton::indicator {
+    width: 16px; height: 16px;
+    border: 2px solid #30363d;
+    border-radius: 9px;
+    background-color: transparent;
+}
+QRadioButton::indicator:hover {
+    border-color: #8b949e;
+}
+QRadioButton::indicator:checked {
+    border: none;
+    background-color: #3b82f6;
+    border-radius: 8px;
+}
+QSlider::groove:horizontal { height: 4px; background: #30363d; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #58a6ff; border-radius: 2px; }
+QSlider::handle:horizontal {
+    width: 14px; height: 14px; margin: -5px 0; border-radius: 7px;
+    background: #f0f6fc; border: 1px solid #8b949e;
+}
+QSlider::handle:horizontal:hover {
+    background: #ffffff; border-color: #58a6ff;
+}
+QSlider::handle:horizontal:pressed {
+    background: #3b82f6; border-color: #ffffff;
+}
+QSpinBox {
+    background-color: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 3px 6px;
+    color: #e6edf3;
+}
+QScrollBar:vertical { background: #0d1117; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #30363d; border-radius: 5px; min-height: 30px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+"""
+
+
+class ToggleSwitch(QWidget):
+    """iOS 风格滑动开关：自绘圆角轨道 + 白色圆点 + 160ms 平滑动画。
+
+    保留 QCheckBox 的常用接口（setChecked / isChecked / toggled / blockSignals），
+    这样设置窗口原有的同步逻辑不用重写。
+    """
+
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._checked = False
+        self._knob = 0.0
+        self._stretch = 0.0
+        self._anim = QPropertyAnimation(self, b"knob", self)
+        # 0.10.07.13：位移 250ms OutExpo；拉伸回弹用 InExpo，末段瞬间收回正圆
+        self._anim.setDuration(250)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutExpo)
+        self._stretch_anim = QPropertyAnimation(self, b"stretch", self)
+        self._stretch_anim.setDuration(250)
+        self._stretch_anim.setEasingCurve(QEasingCurve.Type.InExpo)
+        self.setFixedSize(44, 24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _get_knob(self):
+        return self._knob
+
+    def _set_knob(self, value):
+        # OutExpo 无过冲；夹在 ±0.12 内，避免极端情况下甩出轨道
+        self._knob = max(-0.12, min(1.12, float(value)))
+        self.update()
+
+    knob = pyqtProperty(float, _get_knob, _set_knob)
+
+    def _get_stretch(self):
+        return self._stretch
+
+    def _set_stretch(self, value):
+        self._stretch = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    stretch = pyqtProperty(float, _get_stretch, _set_stretch)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool) -> None:
+        checked = bool(checked)
+        if checked == self._checked:
+            return
+        self._checked = checked
+        self._anim.stop()
+        self._stretch_anim.stop()
+        self._anim.setStartValue(self._knob)
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+        # 挤压拉伸：开始瞬间 1.0，250ms 内收回 0.0（InExpo 让末段快速回弹）
+        self._stretch = 1.0
+        self._stretch_anim.setStartValue(1.0)
+        self._stretch_anim.setEndValue(0.0)
+        self._stretch_anim.start()
+        self.toggled.emit(checked)
+
+    def toggle(self) -> None:
+        self.setChecked(not self._checked)
+
+    def sizeHint(self) -> QSize:
+        return QSize(44, 24)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            if not self.isEnabled():
+                track = QColor("#21262d")
+            elif self._checked:
+                track = QColor("#3b82f6")
+            else:
+                track = QColor("#30363d")
+            painter.setPen(QPen(QColor(255, 255, 255, 28), 1))
+            painter.setBrush(track)
+            painter.drawRoundedRect(QRectF(1, 1, 42, 22), 11, 11)
+            # iOS 挤压拉伸：_stretch=1 时圆点变宽变扁，0 时回正圆
+            knob_d = 18.0
+            knob_w = knob_d * (1.0 + self._stretch * 0.35)
+            knob_h = knob_d / (1.0 + self._stretch * 0.25)
+            x = 2.0 + self._knob * (44.0 - 4.0 - knob_w)
+            y = (24.0 - knob_h) / 2.0
+            center = QPointF(x + knob_w / 2.0, y + knob_h / 2.0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 60))
+            painter.drawEllipse(QPointF(center.x() + 0.6, center.y() + 1.0),
+                                knob_w / 2.0, knob_h / 2.0)
+            painter.setBrush(QColor("#f0f6fc"))
+            painter.drawEllipse(center, knob_w / 2.0, knob_h / 2.0)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            painter.end()
+
+    def mouseReleaseEvent(self, event) -> None:
+        try:
+            if (self.isEnabled()
+                    and event.button() == Qt.MouseButton.LeftButton):
+                self.toggle()
+        except Exception:
+            traceback.print_exc()
+
+    def keyPressEvent(self, event) -> None:
+        try:
+            if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return,
+                               Qt.Key.Key_Enter):
+                self.toggle()
+                return
+        except Exception:
+            traceback.print_exc()
+        super().keyPressEvent(event)
+
+
+class ToggleRow(QWidget):
+    """滑动开关 + 文案的一行；对外保持 QCheckBox 的常用接口。"""
+
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, text: str, parent=None) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self._toggle = ToggleSwitch()
+        self._label = QLabel(text)
+        self._label.setWordWrap(True)
+        layout.addWidget(self._toggle)
+        layout.addWidget(self._label, 1)
+        self._toggle.toggled.connect(self.toggled.emit)
+
+    def setChecked(self, checked: bool) -> None:
+        self._toggle.setChecked(checked)
+
+    def isChecked(self) -> bool:
+        return self._toggle.isChecked()
+
+    def blockSignals(self, block: bool) -> bool:
+        # 必须同时屏蔽子开关，否则父行被 block 后子信号仍会发出去
+        result = super().blockSignals(block)
+        self._toggle.blockSignals(block)
+        return result
+
+    def setEnabled(self, enabled: bool) -> None:
+        super().setEnabled(enabled)
+        self._toggle.setEnabled(enabled)
+        self._label.setEnabled(enabled)
+
+    def setToolTip(self, text: str) -> None:
+        super().setToolTip(text)
+        self._toggle.setToolTip(text)
+        self._label.setToolTip(text)
+
+    def mouseReleaseEvent(self, event) -> None:
+        try:
+            # 点在开关本身上时由 ToggleSwitch 自己处理，避免双击式反向切换
+            if self._toggle.geometry().contains(event.position().toPoint()):
+                return
+            if (self.isEnabled()
+                    and event.button() == Qt.MouseButton.LeftButton):
+                self._toggle.toggle()
+        except Exception:
+            traceback.print_exc()
+
+
+class ModernComboBox(QComboBox):
+    """无系统凸起边框的下拉框：QSS 隐藏原生箭头，右侧自绘极简 ▾。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(30)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QColor("#8C919B"))
+            painter.setFont(QFont("Microsoft YaHei", 9))
+            painter.drawText(
+                QRectF(self.width() - 24, 0, 18, self.height()),
+                Qt.AlignmentFlag.AlignCenter, "▾")
+        except Exception:
+            traceback.print_exc()
+        finally:
+            painter.end()
+
+
+class SmoothSlider(QSlider):
+    """跟手滑块：手柄拖动实时更新；点击轨道用 100ms OutCubic 平滑到目标值。"""
+
+    def __init__(self, orientation, parent=None) -> None:
+        super().__init__(orientation, parent)
+        self.setTracking(True)
+        self._click_anim = None
+
+    def mousePressEvent(self, event) -> None:
+        try:
+            if event.button() != Qt.MouseButton.LeftButton:
+                super().mousePressEvent(event)
+                return
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle = self.style().subControlRect(
+                QStyle.ComplexControl.CC_Slider, opt,
+                QStyle.SubControl.SC_SliderHandle, self)
+            if handle.contains(event.position().toPoint()):
+                # 按在手柄上：交给原生拖动，setTracking(True) 保证实时跟手
+                super().mousePressEvent(event)
+                return
+            # 点击轨道：不要瞬间跳值，100ms OutCubic 平滑过去
+            target = self.style().sliderValueFromPosition(
+                self.minimum(), self.maximum(),
+                int(event.position().x()), self.width())
+            if self._click_anim is not None:
+                self._click_anim.stop()
+            anim = QPropertyAnimation(self, b"value", self)
+            anim.setDuration(100)
+            anim.setStartValue(self.value())
+            anim.setEndValue(target)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._click_anim = anim
+            anim.start()
+            event.accept()
+        except Exception:
+            traceback.print_exc()
 
 class SettingsWindow(QDialog):
     """设置与调试窗口。
@@ -67,7 +411,9 @@ class SettingsWindow(QDialog):
         self._credits = list(credits or [])
 
         self.setWindowTitle("设置与调试")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(640)
+        # 第 7 轮定稿：现代深色 QSS（卡片、无边框下拉、圆角按钮、滑动开关）
+        self.setStyleSheet(SETTINGS_QSS)
 
         # 内容整体放进滚动区：设置窗口内容很高（约 800+ px），
         # 1080p + 150% 缩放时逻辑可用高度只有约 720 px，不限制会被 Windows 摆到奇怪位置、
@@ -78,14 +424,23 @@ class SettingsWindow(QDialog):
         self._scroll.setWidgetResizable(True)
         outer.addWidget(self._scroll)
         content = QWidget()
+        content.setObjectName("settingsContent")
         self._scroll.setWidget(content)
 
         root = QVBoxLayout(content)
-        root.setSpacing(8)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
 
         # 建立淡入淡出动画用的对象（懒创建）；重置时对内容区做 200ms + 200ms 过渡
         self._fade_effect = None
         self._fade_anim = None
+        self._open_anim = None
+        self._open_geom_anim = None
+        self._open_final_geometry = None
+        self._open_force_timer = QTimer(self)
+        self._open_force_timer.setSingleShot(True)
+        self._open_force_timer.timeout.connect(self._force_open_animation_end)
+        self._button_anims = {}
 
         # ---- 设置锁（顶部）：锁上才把配置写进 JSON，重启保留 ----
         lock_row = QHBoxLayout()
@@ -95,19 +450,31 @@ class SettingsWindow(QDialog):
             "锁定设置：重启后保留当前配置；解锁：重启后恢复默认配置")
         self._lock_btn.clicked.connect(self._on_lock_clicked)
         lock_row.addWidget(self._lock_btn)
-        lock_hint = QLabel("锁定后：修改界面模式/刻度/槽位会立即保存，重启保留；"
-                           "解锁后：只在本进程生效，重启恢复默认。")
+        lock_hint = QLabel("锁定：修改立即保存，重启保留；"
+                           "解锁：仅本次运行生效，重启恢复默认。")
         lock_hint.setStyleSheet("color: #8C919B;")
         lock_hint.setWordWrap(True)
         lock_row.addWidget(lock_hint, 1)
         root.addLayout(lock_row)
 
+        # 第 7 轮 0.10.07.13：左右双列，默认一屏放下
+        columns = QHBoxLayout()
+        columns.setSpacing(10)
+        left_col = QVBoxLayout()
+        left_col.setSpacing(8)
+        right_col = QVBoxLayout()
+        right_col.setSpacing(8)
+        columns.addLayout(left_col, 1)
+        columns.addLayout(right_col, 1)
+        root.addLayout(columns)
+
         # ---- 界面模式：挂件（默认）/ 大面板，切换立即生效 ----
-        mode_box = QGroupBox("界面模式")
+        mode_box = QGroupBox("🖥️ 界面模式")
         mode_box.setToolTip("切换大面板模式或任务栏挂件模式")
         mode_row = QHBoxLayout(mode_box)
-        self._mode_widget = QRadioButton("任务栏挂件模式")
-        self._mode_panel = QRadioButton("大面板模式")
+        mode_row.setSpacing(12)
+        self._mode_widget = QRadioButton("🖥️ 任务栏挂件模式")
+        self._mode_panel = QRadioButton("🖥️ 大面板模式")
         self._mode_widget.setToolTip("切换大面板模式或任务栏挂件模式")
         self._mode_panel.setToolTip("切换大面板模式或任务栏挂件模式")
         self._mode_widget.setChecked(True)
@@ -116,124 +483,180 @@ class SettingsWindow(QDialog):
         mode_group.addButton(self._mode_panel)
         mode_row.addWidget(self._mode_widget)
         mode_row.addWidget(self._mode_panel)
-        mode_row.addStretch(1)
-        root.addWidget(mode_box)
+        left_col.addWidget(mode_box)
         self._mode_widget.toggled.connect(self._on_layout_mode_toggled)
         self._mode_panel.toggled.connect(self._on_layout_mode_toggled)
 
         # ---- 系统信息（只读）：挂件模式下这是唯一能看到开机时长/系统版本的地方 ----
-        info_box = QGroupBox("系统信息")
+        info_box = QGroupBox("📊 系统信息")
         info_layout = QVBoxLayout(info_box)
+        info_layout.setSpacing(8)
         self._boot_info = QLabel("开机时长：读取失败")
         self._os_info = QLabel("系统版本：读取失败")
         info_layout.addWidget(self._boot_info)
         info_layout.addWidget(self._os_info)
-        root.addWidget(info_box)
+        right_col.addWidget(info_box)
 
         # ---- 调试模式总开关（始终可点击；关闭时子控件全部置灰）----
-        debug_box = QGroupBox("调试")
+        debug_box = QGroupBox("🐞 调试")
         debug_row = QHBoxLayout(debug_box)
-        self._debug_check = QCheckBox("调试模式")
+        debug_row.setSpacing(16)
+        self._debug_check = ToggleRow("🐞 调试模式")
         self._debug_check.setToolTip("仅用于测试圆环显示，不保存且关闭设置后失效")
         self._hint_label = QLabel("请先开启调试模式")
-        debug_row.addWidget(self._debug_check)
+        self._hint_label.setStyleSheet("color: #8C919B;")
+        debug_row.addWidget(self._debug_check, 1)
         debug_row.addWidget(self._hint_label)
-        debug_row.addStretch(1)
-        root.addWidget(debug_box)
+        left_col.addWidget(debug_box)
 
-        # ---- 各项调试行：名称 + 滑块 + 数值框 + 应用/恢复 ----
-        rows_box = QGroupBox("各项调试值（0~100）")
-        grid = QGridLayout(rows_box)
-        grid.addWidget(QLabel("项目"), 0, 0)
-        grid.addWidget(QLabel("滑块"), 0, 1)
-        grid.addWidget(QLabel("数值"), 0, 2)
-        grid.addWidget(QLabel("操作"), 0, 3)
+        # ---- 各项调试值：紧凑双列，每行 [项目][滑块][数值]，默认隐藏 ----
+        # 用普通 QWidget 而不是 QGroupBox：QGroupBox 有 title/padding，
+        # maximumHeight=0 时仍会留一条，无法做到收起后完全不占高度。
+        rows_card = QWidget()
+        rows_card.setObjectName("debugRowsCard")
+        rows_card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        rows_card.setMaximumHeight(0)
+        rows_card.setVisible(False)
+        # 外层只负责 maximumHeight 动画；内层负责 opacity 淡入，避免高度变化时重排
+        outer_rows_layout = QVBoxLayout(rows_card)
+        outer_rows_layout.setContentsMargins(0, 0, 0, 0)
+        outer_rows_layout.setSpacing(0)
+        rows_inner = QWidget()
+        outer_rows_layout.addWidget(rows_inner)
+        rows_layout = QVBoxLayout(rows_inner)
+        rows_layout.setContentsMargins(6, 6, 6, 6)
+        rows_layout.setSpacing(2)
+        rows_title = QLabel("🎚️ 各项调试值（0~100）")
+        rows_title.setStyleSheet("color: #C9CED6; font-size: 11px;")
+        rows_layout.addWidget(rows_title)
 
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(2)
         self._sliders = {}
         self._spins = {}
-        self._apply_btns = {}
-        self._restore_btns = {}
         # 调试项 = 动态数据池里除齿轮外的全部数据项（含 D盘、总盘等新增项）。
-        # 不能再用 reader.items 的固定五项，否则新增磁盘项无法调试。
         debug_items = [(key, label) for key, label in self._panel.available_slot_items()
                        if key != "gear"]
-        for row, (key, label) in enumerate(debug_items, start=1):
-            grid.addWidget(QLabel(label), row, 0)
-
-            slider = QSlider(Qt.Orientation.Horizontal)
+        debug_icons = {"cpu": "🧠", "gpu": "🎮", "mem": "🧩",
+                       "disk_c": "💾", "disk_total": "💽", "battery": "🔋"}
+        for idx, (key, label) in enumerate(debug_items):
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            name_label = QLabel(f"{debug_icons.get(key, '💽')} {label}")
+            name_label.setFixedWidth(46)
+            name_label.setStyleSheet("font-size: 11px;")
+            slider = SmoothSlider(Qt.Orientation.Horizontal)
             slider.setRange(0, 100)
-            slider.setMinimumWidth(150)
-            grid.addWidget(slider, row, 1)
-
+            slider.setTracking(True)
+            slider.setMinimumWidth(60)
+            slider.setFixedHeight(22)
             spin = QSpinBox()
             spin.setRange(0, 100)
-            spin.setFixedWidth(64)
-            grid.addWidget(spin, row, 2)
-
-            btn_row = QHBoxLayout()
-            apply_btn = QPushButton("应用调试值")
-            restore_btn = QPushButton("恢复真实值")
-            btn_row.addWidget(apply_btn)
-            btn_row.addWidget(restore_btn)
-            grid.addLayout(btn_row, row, 3)
-
-            # 滑块与数值框双向同步；值相同时 Qt 不会重复发信号，不会形成死循环
+            spin.setFixedWidth(40)
+            spin.setFixedHeight(22)
+            row_layout.addWidget(name_label)
+            row_layout.addWidget(slider, 1)
+            row_layout.addWidget(spin)
+            row_widget.setFixedHeight(26)
             slider.valueChanged.connect(spin.setValue)
             spin.valueChanged.connect(slider.setValue)
-            apply_btn.clicked.connect(lambda _checked=False, k=key: self._on_apply(k))
-            restore_btn.clicked.connect(lambda _checked=False, k=key: self._on_restore(k))
-
+            grid.addWidget(row_widget, idx // 2, idx % 2)
             self._sliders[key] = slider
             self._spins[key] = spin
-            self._apply_btns[key] = apply_btn
-            self._restore_btns[key] = restore_btn
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        rows_layout.addLayout(grid)
 
-        root.addWidget(rows_box)
+        all_btn_row = QHBoxLayout()
+        self._apply_all_btn = QPushButton("应用全部调试值")
+        self._restore_all_btn = QPushButton("恢复全部真实值")
+        self._apply_all_btn.clicked.connect(self._on_apply_all)
+        self._restore_all_btn.clicked.connect(self._on_restore_all)
+        self._apply_all_btn.setFixedHeight(26)
+        self._restore_all_btn.setFixedHeight(26)
+        all_btn_row.addWidget(self._apply_all_btn, 1)
+        all_btn_row.addWidget(self._restore_all_btn, 1)
+        rows_layout.addLayout(all_btn_row)
+
+        # 内层固定高度：外层 maximumHeight 动画时内容不会被挤压变形
+        rows_layout.activate()
+        rows_inner.setFixedHeight(max(150, rows_inner.sizeHint().height()))
+        self._rows_inner = rows_inner
+        # 0.10.07.13：只给 rows_card 外层挂一个 opacity effect；
+        # rows_inner 不再挂任何 effect，避免 effect 嵌套导致重影/消失。
+        self._rows_effect = QGraphicsOpacityEffect(rows_card)
+        self._rows_effect.setOpacity(0.0)
+        rows_card.setGraphicsEffect(self._rows_effect)
+        self._rows_inner_anim = QPropertyAnimation(
+            self._rows_effect, b"opacity", self)
+        self._rows_inner_anim.setDuration(250)
+        self._rows_inner_anim.setEasingCurve(QEasingCurve.Type.OutExpo)
+        self._rows_opacity_timer = QTimer(self)
+        self._rows_opacity_timer.setSingleShot(True)
+        self._rows_opacity_timer.timeout.connect(self._start_rows_opacity_in)
+
+        self._rows_box = rows_card
+        left_col.addWidget(rows_card)
+        # 0.10.07.13：调试卡不再用阴影 effect，只用 QSS 的 border + 背景色
+
+        # 0.10.07.13：高度 0→220 / 220→0，250ms OutExpo
+        self._rows_anim = QPropertyAnimation(self._rows_box, b"maximumHeight", self)
+        self._rows_anim.setDuration(250)
+        self._rows_anim.setEasingCurve(QEasingCurve.Type.OutExpo)
+        self._rows_anim.finished.connect(self._on_rows_anim_finished)
+        self._rows_force_timer = QTimer(self)
+        self._rows_force_timer.setSingleShot(True)
+        self._rows_force_timer.timeout.connect(self._force_rows_animation_end)
+        self._rows_expanded = False
 
         # ---- 五项检测开关（默认全开；关闭后主窗口对应环显示红叉 + 检测已关闭）----
-        detect_box = QGroupBox("启用检测")
-        detect_row = QHBoxLayout(detect_box)
+        detect_box = QGroupBox("🔍 启用检测")
+        detect_grid = QGridLayout(detect_box)
+        detect_grid.setHorizontalSpacing(18)
+        detect_grid.setVerticalSpacing(8)
         self._detect_checks = {}
-        for item in self._reader.items:
-            check = QCheckBox(item.name)
+        detect_icons = {"cpu": "🧠", "mem": "🧩", "gpu": "🎮",
+                        "disk_c": "💾", "battery": "🔋"}
+        for idx, item in enumerate(self._reader.items):
+            check = ToggleRow(f"{detect_icons.get(item.key, '🔍')} {item.name}")
             check.setToolTip("关闭后该项圆环将显示红叉，用于测试失败状态")
             check.setChecked(self._reader.enabled.get(item.key, True))
-            check.toggled.connect(lambda checked, k=item.key: self._on_toggle_detect(k, checked))
-            detect_row.addWidget(check)
+            check.toggled.connect(
+                lambda checked, k=item.key: self._on_toggle_detect(k, checked))
+            detect_grid.addWidget(check, idx // 2, idx % 2)
             self._detect_checks[item.key] = check
-        detect_row.addStretch(1)
-        root.addWidget(detect_box)
+        detect_grid.setColumnStretch(0, 1)
+        detect_grid.setColumnStretch(1, 1)
+        right_col.addWidget(detect_box)
 
-        # ---- 挂件槽位：5 个位置全部可配，每项互斥、可放齿轮 ----
-        self._slot_box = QGroupBox("挂件环配置")
+        # ---- 槽位：5 个位置全部可配，挂件与大面板共用，每项互斥、可放齿轮 ----
+        self._slot_box = QGroupBox("🧩 环配置（挂件 / 大面板）")
         slot_layout = QVBoxLayout(self._slot_box)
-        slot_tip = QLabel("5 个槽位全部可配：可选 CPU / GPU / 内存 / C盘 / 总盘 / "
-                          "各固定磁盘 / 电池 / 齿轮，五个位置不能重复。"
-                          "默认 CPU + GPU + 内存 + C盘 + 齿轮。")
-        slot_tip.setWordWrap(True)
-        slot_tip.setStyleSheet("color: #8C919B;")
-        slot_layout.addWidget(slot_tip)
-
-        slot_grid = QGridLayout()
+        slot_layout.setSpacing(10)
+        # 0.10.07.13：5 个下拉框直接横排，作为底部长条（不额外加说明，保持一屏）
+        slot_row = QHBoxLayout()
+        slot_row.setSpacing(8)
         self._slot_combos = []
         for index in range(5):
-            slot_grid.addWidget(QLabel(f"第 {index + 1} 位"), index, 0)
-            combo = QComboBox()
-            combo.setMinimumWidth(120)      # 防止选项文本变化时被布局挤成 0 宽
-            combo.setToolTip("选择该位置显示的数据项")
+            combo = ModernComboBox()
+            combo.setMinimumWidth(92)      # 横排时仍保证文本不被挤成 0 宽
+            combo.setToolTip(f"第 {index + 1} 位：选择该位置显示的数据项")
             combo.currentIndexChanged.connect(self._on_slot_combo_changed)
-            slot_grid.addWidget(combo, index, 1)
+            slot_row.addWidget(combo)
             self._slot_combos.append(combo)
-        self._reset_slots_btn = QPushButton("恢复默认环配置")
+        self._reset_slots_btn = QPushButton("恢复默认")
         self._reset_slots_btn.setToolTip("重置五个槽位为默认配置（CPU / GPU / 内存 / C盘 / 齿轮）")
         self._reset_slots_btn.setIcon(QApplication.style().standardIcon(
             QStyle.StandardPixmap.SP_BrowserReload))
         self._reset_slots_btn.setIconSize(QSize(16, 16))
         self._reset_slots_btn.clicked.connect(self._on_reset_slots)
-        slot_grid.addWidget(self._reset_slots_btn, 5, 1)
-        slot_layout.addLayout(slot_grid)
+        slot_row.addWidget(self._reset_slots_btn)
+        slot_layout.addLayout(slot_row)
 
-        self._slot_hint = QLabel("仅任务栏挂件模式支持自定义环")
+        self._slot_hint = QLabel("挂件与大面板共用同一套槽位配置")
         self._slot_hint.setStyleSheet("color: #8C919B;")
         slot_layout.addWidget(self._slot_hint)
         # 系统合成关闭时挂件无法真透明（会变黑），这里给用户一个明确提示
@@ -247,23 +670,49 @@ class SettingsWindow(QDialog):
         # ---- 外观：显示环形刻度（两种模式通用，不随模式置灰）----
         # 刻度是环的通用视觉元素，挂件小环与大面板大环共用同一个开关；
         # 不持久化，重启后回到默认勾选。
-        look_box = QGroupBox("外观")
+        look_box = QGroupBox("🎨 外观")
         look_layout = QVBoxLayout(look_box)
-        self._show_ticks_check = QCheckBox("显示环形刻度")
+        look_layout.setSpacing(12)
+        self._show_ticks_check = ToggleRow("📏 显示环形刻度")
         self._show_ticks_check.setToolTip("控制圆环上是否显示刻度线")
         self._show_ticks_check.setChecked(self._panel.show_ticks_enabled())
         self._show_ticks_check.toggled.connect(self._on_show_ticks_toggled)
         look_layout.addWidget(self._show_ticks_check)
-        ticks_hint = QLabel("关闭后只隐藏环形外圈的刻度线，底环、进度弧与环内名称照常显示。")
-        ticks_hint.setStyleSheet("color: #8C919B;")
-        ticks_hint.setWordWrap(True)
-        look_layout.addWidget(ticks_hint)
-        root.addWidget(look_box)
+        # 第 7 轮：环中心图标/文字切换。默认勾选；与刻度开关一样受设置锁控制，
+        # 锁上时由主窗口立即写 JSON，解锁时只在本次运行生效、重启回到默认勾选。
+        self._icon_style_check = ToggleRow("✨ 使用拟物化图标")
+        self._icon_style_check.setToolTip(
+            "勾选后环中心显示拟物图标（下方可选多色/单色）；取消后恢复显示项目名称文字")
+        self._icon_style_check.setChecked(self._panel.use_icon_style_enabled())
+        self._icon_style_check.toggled.connect(self._on_icon_style_toggled)
+        look_layout.addWidget(self._icon_style_check)
+
+        # 第 7 轮完全体：图标风格下拉（多色拟物 / 单色线条）。
+        # 默认多色；与图标开关一样受设置锁控制，锁上时由主窗口立即写 JSON。
+        style_row = QHBoxLayout()
+        style_label = QLabel("🎨 图标风格")
+        style_label.setStyleSheet("color: #8C919B;")
+        style_row.addWidget(style_label)
+        self._icon_style_combo = ModernComboBox()
+        self._icon_style_combo.addItem("多色拟物", "color")
+        self._icon_style_combo.addItem("单色线条", "line")
+        self._icon_style_combo.setMinimumWidth(120)
+        self._icon_style_combo.setToolTip(
+            "多色拟物：半透明填充 + 微渐变 + 高光；单色线条：1.2px 描边")
+        idx = self._icon_style_combo.findData(self._panel.icon_style())
+        if idx >= 0:
+            self._icon_style_combo.setCurrentIndex(idx)
+        self._icon_style_combo.currentIndexChanged.connect(self._on_icon_style_changed)
+        style_row.addWidget(self._icon_style_combo)
+        style_row.addStretch(1)
+        look_layout.addLayout(style_row)
+        left_col.addWidget(look_box)
 
         # ---- 任务栏吸附（第二阶段）：状态不持久化，重启恢复默认勾选 ----
-        dock_box = QGroupBox("任务栏吸附")
+        dock_box = QGroupBox("📌 任务栏吸附")
         dock_layout = QVBoxLayout(dock_box)
-        self._auto_dock_check = QCheckBox("自动吸附到任务栏")
+        dock_layout.setSpacing(10)
+        self._auto_dock_check = ToggleRow("📌 自动吸附到任务栏")
         self._auto_dock_check.setToolTip("取消后挂件将不再固定在任务栏，可自由拖动")
         dock_layout.addWidget(self._auto_dock_check)
         self._dock_hint = QLabel("")
@@ -274,7 +723,8 @@ class SettingsWindow(QDialog):
         self._auto_dock_mode_hint.setStyleSheet("color: #8C919B;")
         self._auto_dock_mode_hint.setVisible(False)
         dock_layout.addWidget(self._auto_dock_mode_hint)
-        root.addWidget(dock_box)
+        # 0.10.07.13：调试行展开后左列过高，任务栏吸附移到右列以保持 ≤750 无滚动
+        right_col.addWidget(dock_box)
         if not self._auto_dock_available:
             # 总开关 AUTO_DOCK_ENABLED = False：完全回到第一阶段行为，复选框禁用
             self._auto_dock_check.setEnabled(False)
@@ -282,13 +732,12 @@ class SettingsWindow(QDialog):
         self._auto_dock_check.toggled.connect(self._on_auto_dock_toggled)
 
         # ---- GitHub 按钮（打开 APP_REPO_URL 指向的真实仓库地址）----
-        self._github_btn = QPushButton("打开 GitHub 仓库")
+        self._github_btn = QPushButton("🐙 打开 GitHub 仓库")
         self._github_btn.setToolTip("在浏览器中打开项目仓库")
         self._github_btn.clicked.connect(self._on_github)
-        root.addWidget(self._github_btn)
 
         # ---- 关于（只读）：作者与仓库地址，字号比正文小一号、颜色 #8C919B ----
-        about_box = QGroupBox("关于")
+        about_box = QGroupBox("ℹ️ 关于")
         about_layout = QVBoxLayout(about_box)
         # 作者为空时显示"未填写"，避免出现孤零零的"作者：@"
         self._author_label = QLabel(
@@ -303,7 +752,7 @@ class SettingsWindow(QDialog):
         # ---- 制作人员（只读）：四行署名，字号比正文小一号、颜色 #8C919B、行距紧凑 ----
         self._credits_labels = []
         if self._credits:
-            credits_title = QLabel("制作人员")
+            credits_title = QLabel("👥 制作人员")
             credits_title.setStyleSheet("color: #8C919B; font-size: 11px;")
             about_layout.addWidget(credits_title)
         for role, member in self._credits:
@@ -312,7 +761,9 @@ class SettingsWindow(QDialog):
             about_layout.addWidget(credit_label)
             self._credits_labels.append(credit_label)
         about_layout.setSpacing(2)          # 行距紧凑，避免四行占太多高度
-        root.addWidget(about_box)
+        right_col.addWidget(about_box)
+        right_col.addStretch(1)
+        right_col.addWidget(self._github_btn)
 
         # ---- 版本号（与主窗口显示同一四段版本号）----
         self._version_label = QLabel(f"版本 {self._app_version}")
@@ -325,12 +776,80 @@ class SettingsWindow(QDialog):
             QStyle.StandardPixmap.SP_BrowserReload))
         self._reset_all_btn.setIconSize(QSize(16, 16))
         self._reset_all_btn.clicked.connect(self._on_reset_all)
-        root.addWidget(self._reset_all_btn)
+        left_col.addStretch(1)
+        left_col.addWidget(self._reset_all_btn)
 
         # 初始状态：调试模式关闭，五项调试子控件全部禁用
         self._debug_check.toggled.connect(self._on_debug_toggled)
         self._set_debug_widgets_enabled(False)
         self._sync_lock_button()
+
+        # 第 7 轮定稿：QSS 不支持 box-shadow，卡片阴影统一用 QGraphicsDropShadowEffect
+        for box in self.findChildren(QGroupBox):
+            self._apply_card_shadow(box)
+
+        # 0.10.07.13：所有按钮统一阴影 + 按压回弹
+        for button in (self._apply_all_btn, self._restore_all_btn,
+                       self._reset_all_btn, self._reset_slots_btn,
+                       self._github_btn):
+            self._install_button_feedback(button)
+
+    @staticmethod
+    def _apply_card_shadow(widget) -> None:
+        """给卡片加柔和阴影；效果参数固定，避免不同卡片质感不一致。"""
+        try:
+            effect = QGraphicsDropShadowEffect(widget)
+            effect.setBlurRadius(20)
+            effect.setOffset(0, 5)
+            effect.setColor(QColor(0, 0, 0, 130))
+            widget.setGraphicsEffect(effect)
+        except Exception:
+            traceback.print_exc()
+
+    def _install_button_feedback(self, button) -> None:
+        """按钮阴影：按下压缩贴合，松开 120ms OutQuad 回弹。"""
+        try:
+            effect = QGraphicsDropShadowEffect(button)
+            effect.setBlurRadius(20)
+            effect.setOffset(0, 5)
+            effect.setColor(QColor(0, 0, 0, 120))
+            button.setGraphicsEffect(effect)
+            button.pressed.connect(
+                lambda b=button, e=effect: self._on_button_pressed(b, e))
+            button.released.connect(
+                lambda b=button, e=effect: self._on_button_released(b, e))
+        except Exception:
+            traceback.print_exc()
+
+    def _on_button_pressed(self, button, effect) -> None:
+        try:
+            for anim in self._button_anims.get(button, ()):
+                anim.stop()
+            # 阴影变小、偏移变大：视觉上贴合底部并轻微下沉
+            effect.setBlurRadius(8)
+            effect.setOffset(0, 8)
+        except Exception:
+            traceback.print_exc()
+
+    def _on_button_released(self, button, effect) -> None:
+        try:
+            for anim in self._button_anims.get(button, ()):
+                anim.stop()
+            blur_anim = QPropertyAnimation(effect, b"blurRadius", effect)
+            blur_anim.setDuration(120)
+            blur_anim.setStartValue(effect.blurRadius())
+            blur_anim.setEndValue(20)
+            blur_anim.setEasingCurve(QEasingCurve.Type.OutQuad)
+            offset_anim = QPropertyAnimation(effect, b"offset", effect)
+            offset_anim.setDuration(120)
+            offset_anim.setStartValue(effect.offset())
+            offset_anim.setEndValue(QPointF(0, 5))
+            offset_anim.setEasingCurve(QEasingCurve.Type.OutQuad)
+            self._button_anims[button] = (blur_anim, offset_anim)
+            blur_anim.start()
+            offset_anim.start()
+        except Exception:
+            traceback.print_exc()
 
     # ------------------------------------------------------------------ 显示前准备
 
@@ -347,7 +866,8 @@ class SettingsWindow(QDialog):
             if screen is None:
                 return
             avail = screen.availableGeometry()
-            max_h = max(400, avail.height() - 80)
+            # 死命令：设置窗口高度绝不超过 750px；放不下的调试值交给滚动区
+            max_h = min(750, max(400, avail.height() - 80))
             self.setMinimumHeight(400)
             self.setMaximumHeight(max_h)
 
@@ -355,12 +875,112 @@ class SettingsWindow(QDialog):
             frame = 2 * self._scroll.frameWidth()
             content = self._scroll.widget()
             hint = content.sizeHint() if content is not None else self.sizeHint()
-            width = max(self.minimumWidth(), hint.width() + frame)
+            # 死命令：宽度约 600~700，双列一屏；高度不超过 750
+            width = min(700, max(self.minimumWidth(), hint.width() + frame))
             height = min(max(400, hint.height() + frame), max_h)
             self.resize(width, height)
             self._scroll.verticalScrollBar().setValue(0)   # 每次打开都从顶部开始
         except Exception:
             traceback.print_exc()
+
+    def start_open_animation(self) -> None:
+        """由主窗口在 prepare_for_show → show → 贴底定位之后调用。
+
+        此时 geometry 才是最终位置；不要在 showEvent 里提前启动，
+        否则先按旧位置做动画、随后又被 _place_settings_window() 搬走，会产生残影。
+        """
+        self._play_open_fade()
+
+    def _play_open_fade(self) -> None:
+        """类 macOS 弹出：仅 opacity 0→1 + y 下移 15px 滑回，250ms OutExpo。
+
+        不改宽高、不固定内容尺寸、不动滚动条策略，避免截图/失焦时窗口消失。
+        """
+        try:
+            self._stop_open_animation()
+            # 注意：这里不能再检查 _fade_anim（恢复默认设置的淡出动画）。
+            # 打开流程已由主窗口把 windowOpacity 设为 0，若因无关动画仍在跑而提前
+            # return，就会留下 opacity=0 的"隐形窗口"，正是本轮要消灭的消失问题。
+            final = QRect(self.geometry())
+            self._open_final_geometry = final
+            self.setWindowOpacity(0.0)
+            start = QRect(final.x(), final.y() + 15,
+                          final.width(), final.height())
+            self.setGeometry(start)
+
+            opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
+            opacity_anim.setDuration(250)
+            opacity_anim.setStartValue(0.0)
+            opacity_anim.setEndValue(1.0)
+            opacity_anim.setEasingCurve(QEasingCurve.Type.OutExpo)
+
+            geom_anim = QPropertyAnimation(self, b"geometry", self)
+            geom_anim.setDuration(250)
+            geom_anim.setStartValue(start)
+            geom_anim.setEndValue(final)
+            geom_anim.setEasingCurve(QEasingCurve.Type.OutExpo)
+            geom_anim.finished.connect(self._finish_open_animation)
+
+            self._open_anim = opacity_anim
+            self._open_geom_anim = geom_anim
+            self._open_force_timer.start(400)
+            opacity_anim.start()
+            geom_anim.start()
+        except Exception:
+            traceback.print_exc()
+
+    def _finish_open_animation(self) -> None:
+        """正常结束：强制 opacity=1、回到最终 geometry，并清理可能残留的 scroll effect。"""
+        try:
+            self._open_force_timer.stop()
+            self._open_anim = None
+            self._open_geom_anim = None
+            self.setWindowOpacity(1.0)
+            if self._open_final_geometry is not None:
+                self.setGeometry(self._open_final_geometry)
+            eff = self._scroll.graphicsEffect()
+            if isinstance(eff, QGraphicsOpacityEffect):
+                self._scroll.setGraphicsEffect(None)
+        except Exception:
+            traceback.print_exc()
+
+    def _force_open_animation_end(self) -> None:
+        """400ms 保险：无论失焦/截图/动画被打断，都收敛到可见的最终态。"""
+        try:
+            if self._open_anim is not None:
+                self._open_anim.stop()
+            if self._open_geom_anim is not None:
+                self._open_geom_anim.stop()
+            self._open_anim = None
+            self._open_geom_anim = None
+            self.setWindowOpacity(1.0)
+            if self._open_final_geometry is not None:
+                self.setGeometry(self._open_final_geometry)
+            eff = self._scroll.graphicsEffect()
+            if isinstance(eff, QGraphicsOpacityEffect):
+                self._scroll.setGraphicsEffect(None)
+        except Exception:
+            traceback.print_exc()
+
+    def _stop_open_animation(self) -> None:
+        """中途关闭/重置时停止弹窗动画，并立即恢复可见的最终状态。"""
+        try:
+            self._open_force_timer.stop()
+            if self._open_anim is not None:
+                self._open_anim.stop()
+            if self._open_geom_anim is not None:
+                self._open_geom_anim.stop()
+            self.setWindowOpacity(1.0)
+            if self._open_final_geometry is not None:
+                self.setGeometry(self._open_final_geometry)
+            eff = self._scroll.graphicsEffect()
+            if isinstance(eff, QGraphicsOpacityEffect):
+                self._scroll.setGraphicsEffect(None)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self._open_anim = None
+            self._open_geom_anim = None
 
     # ------------------------------------------------------------------ 状态同步
 
@@ -370,7 +990,7 @@ class SettingsWindow(QDialog):
         注意：只禁用子控件，总开关本身永远保持可点击，
         否则关掉调试后就没法再打开。
         """
-        for widgets in (self._sliders, self._spins, self._apply_btns, self._restore_btns):
+        for widgets in (self._sliders, self._spins):
             for widget in widgets.values():
                 widget.setEnabled(enabled)
         self._hint_label.setVisible(not enabled)
@@ -405,6 +1025,7 @@ class SettingsWindow(QDialog):
             self._debug_check.setChecked(False)      # 不记住上次状态
             self._debug_check.blockSignals(False)
             self._set_debug_widgets_enabled(False)
+            self._collapse_debug_rows_immediate()
             self._reader.debug_active = False
             self._reader.debug_values.clear()
             self._reader.apply_state()
@@ -422,6 +1043,19 @@ class SettingsWindow(QDialog):
             self.sync_show_ticks()
             self._sync_lock_button()
             self._refresh_mode_dependent_ui()
+            # 0.10.07.13：弹入动画由主窗口在贴底定位后调用 start_open_animation()
+        except Exception:
+            traceback.print_exc()
+
+    def changeEvent(self, event) -> None:
+        """失焦（如截图工具抢焦点）时若弹入动画未结束，立即强制收敛到最终态。"""
+        super().changeEvent(event)
+        try:
+            if (event.type() == QEvent.Type.ActivationChange
+                    and not self.isActiveWindow()
+                    and (self._open_anim is not None
+                         or self._open_geom_anim is not None)):
+                self._force_open_animation_end()
         except Exception:
             traceback.print_exc()
 
@@ -433,6 +1067,7 @@ class SettingsWindow(QDialog):
         """
         super().hideEvent(event)
         try:
+            self._stop_open_animation()
             self._reset_on_close()
         except Exception:
             traceback.print_exc()
@@ -458,6 +1093,7 @@ class SettingsWindow(QDialog):
             self._debug_check.setChecked(False)
             self._debug_check.blockSignals(False)
             self._set_debug_widgets_enabled(False)
+            self._collapse_debug_rows_immediate()
             self._reader.debug_active = False
             self._reader.debug_values.clear()
             self._reader.apply_state()
@@ -484,31 +1120,124 @@ class SettingsWindow(QDialog):
                 self._reader.debug_values.clear()
                 self._reader.apply_state()
                 self._panel.resume_refresh()
+            # 0.10.07.13：高度 0↔220 + 内容 opacity 联动
+            self._animate_debug_rows(bool(checked))
         except Exception:
             traceback.print_exc()
 
-    def _on_apply(self, key: str) -> None:
-        """应用某一项的调试值：仅在调试模式开启时生效。"""
+    def _animate_debug_rows(self, expand: bool) -> None:
+        """调试值卡片平滑展开/收起；收起完成后 setVisible(False) 完全不占高度。"""
+        try:
+            self._rows_anim.stop()
+            self._rows_opacity_timer.stop()
+            self._rows_inner_anim.stop()
+            # 350ms 保险：即使鼠标晃动/失焦/截图打断，也强制收敛
+            self._rows_force_timer.start(350)
+            if expand:
+                self._rows_effect.setOpacity(0.0)
+                self._rows_box.setVisible(True)
+                self._rows_box.setMaximumHeight(0)
+                self._rows_anim.setStartValue(0)
+                self._rows_anim.setEndValue(220)
+                self._rows_expanded = True
+                self._rows_anim.start()
+                # 高度先动，50ms 后内容淡入
+                self._rows_opacity_timer.start(50)
+                return
+            if not self._rows_box.isVisible():
+                self._collapse_debug_rows_immediate()
+                return
+            self._rows_inner_anim.setStartValue(
+                self._rows_effect.opacity())
+            self._rows_inner_anim.setEndValue(0.0)
+            self._rows_inner_anim.start()
+            self._rows_anim.setStartValue(max(0, self._rows_box.height()))
+            self._rows_anim.setEndValue(0)
+            self._rows_expanded = False
+            self._rows_anim.start()
+        except Exception:
+            traceback.print_exc()
+
+    def _start_rows_opacity_in(self) -> None:
+        """高度展开 50ms 后启动内容淡入，避免生硬地一起被拉出来。"""
+        try:
+            if not self._rows_expanded:
+                return
+            self._rows_inner_anim.stop()
+            self._rows_inner_anim.setStartValue(
+                self._rows_effect.opacity())
+            self._rows_inner_anim.setEndValue(1.0)
+            self._rows_inner_anim.start()
+        except Exception:
+            traceback.print_exc()
+
+    def _on_rows_anim_finished(self) -> None:
+        try:
+            if self._rows_expanded:
+                self._rows_box.setMaximumHeight(220)
+            else:
+                self._rows_effect.setOpacity(0.0)
+                self._rows_box.setVisible(False)
+                self._rows_box.setMaximumHeight(0)
+        except Exception:
+            traceback.print_exc()
+
+    def _force_rows_animation_end(self) -> None:
+        """350ms 保险：停止所有调试卡动画，强制写入展开/收起终态。"""
+        try:
+            self._rows_force_timer.stop()
+            self._rows_anim.stop()
+            self._rows_opacity_timer.stop()
+            self._rows_inner_anim.stop()
+            if self._rows_expanded:
+                self._rows_box.setVisible(True)
+                self._rows_box.setMaximumHeight(220)
+                self._rows_effect.setOpacity(1.0)
+            else:
+                self._rows_box.setVisible(False)
+                self._rows_box.setMaximumHeight(0)
+                self._rows_effect.setOpacity(0.0)
+        except Exception:
+            traceback.print_exc()
+
+    def _collapse_debug_rows_immediate(self) -> None:
+        """关闭设置/复位调试时立即收起，不留下动画中的半截卡片。"""
+        try:
+            if self._rows_anim is not None:
+                self._rows_anim.stop()
+            if self._rows_force_timer is not None:
+                self._rows_force_timer.stop()
+            if self._rows_opacity_timer is not None:
+                self._rows_opacity_timer.stop()
+            if self._rows_inner_anim is not None:
+                self._rows_inner_anim.stop()
+            self._rows_effect.setOpacity(0.0)
+            self._rows_expanded = False
+            self._rows_box.setVisible(False)
+            self._rows_box.setMaximumHeight(0)
+        except Exception:
+            traceback.print_exc()
+
+    def _on_apply_all(self) -> None:
+        """应用全部调试值：遍历所有滑块，一次性写入 debug_values 并重绘。"""
         try:
             if not self._debug_check.isChecked():
                 return
             self._reader.debug_active = True
-            self._reader.debug_values[key] = float(self._spins[key].value())
+            for key, spin in self._spins.items():
+                self._reader.debug_values[key] = float(spin.value())
             self._reader.apply_state()
             self._panel.update()
         except Exception:
             traceback.print_exc()
 
-    def _on_restore(self, key: str) -> None:
-        """把某一项恢复为真实读数（不关闭整个调试模式）。"""
+    def _on_restore_all(self) -> None:
+        """恢复全部真实值：清空调试值并用 _sync_sliders_from_real 回填所有项。"""
         try:
-            self._reader.debug_values.pop(key, None)
+            self._reader.debug_values.clear()
             self._reader.apply_state()
             self._panel.update()
-            # 数值框跟着回到真实值，方便用户确认
-            spin = self._spins.get(key)
-            if spin is not None:
-                spin.setValue(self._reader.real_value(key))
+            self._sync_sliders_from_real()
         except Exception:
             traceback.print_exc()
 
@@ -565,15 +1294,18 @@ class SettingsWindow(QDialog):
             traceback.print_exc()
 
     def _refresh_mode_dependent_ui(self) -> None:
-        """按当前模式启用/禁用相关区域（挂件配置、吸附开关）。"""
+        """按当前模式启用/禁用相关区域；槽位配置在两种模式下都可用。"""
         try:
             widget = self._panel.layout_mode() == "widget"
-            self._slot_box.setEnabled(widget)
-            self._slot_hint.setVisible(not widget)
+            # 第 7 轮：大面板同样支持自定义槽位，不能再按模式禁用整个配置区
+            self._slot_box.setEnabled(True)
+            self._slot_hint.setVisible(False)
             self._widget_bg_hint.setVisible(
                 widget and not self._panel.widget_background_transparent())
             self._auto_dock_check.setEnabled(widget and self._auto_dock_available)
             self._auto_dock_mode_hint.setVisible(not widget)
+            # 图标/文字开关在挂件与大面板都生效，这里只负责把复选框同步到真实状态
+            self.sync_icon_style()
         except Exception:
             traceback.print_exc()
 
@@ -592,6 +1324,42 @@ class SettingsWindow(QDialog):
         """「显示环形刻度」开关：只改主窗口绘制，不重建任何控件。"""
         try:
             self._panel.set_show_ticks(bool(checked))
+        except Exception:
+            traceback.print_exc()
+
+    # ------------------------------------------------------------------ 拟物化图标
+
+    def sync_icon_style(self) -> None:
+        """把图标复选框与风格下拉同步到主窗口当前状态（不触发切换回调）。"""
+        try:
+            self._icon_style_check.blockSignals(True)
+            self._icon_style_check.setChecked(self._panel.use_icon_style_enabled())
+            self._icon_style_check.blockSignals(False)
+            combo = getattr(self, "_icon_style_combo", None)
+            if combo is not None:
+                target = self._panel.icon_style()
+                # 只有状态不一致时才改下拉，避免用户刚选完时再次 setCurrentIndex
+                # 干扰正在关闭的弹出层（弹出层收起问题上一轮已踩过坑）。
+                if combo.currentData() != target:
+                    combo.blockSignals(True)
+                    idx = combo.findData(target)
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
+                    combo.blockSignals(False)
+        except Exception:
+            traceback.print_exc()
+
+    def _on_icon_style_toggled(self, checked: bool) -> None:
+        """切换图标/文字：立即重绘主窗口；锁上时由主窗口负责写盘。"""
+        try:
+            self._panel.set_use_icon_style(bool(checked))
+        except Exception:
+            traceback.print_exc()
+
+    def _on_icon_style_changed(self, _index: int = 0) -> None:
+        """切换多色拟物 / 单色线条：立即重绘主窗口并受锁持久化。"""
+        try:
+            self._panel.set_icon_style(self._icon_style_combo.currentData())
         except Exception:
             traceback.print_exc()
 
@@ -683,6 +1451,8 @@ class SettingsWindow(QDialog):
         try:
             if self._fade_anim is not None and self._fade_anim.state() == QPropertyAnimation.State.Running:
                 return
+            # 若弹窗动画还在跑，先停掉并恢复内容尺寸/滚动条
+            self._stop_open_animation()
             self._reset_all_btn.setEnabled(False)
             effect = QGraphicsOpacityEffect(self._scroll)
             self._scroll.setGraphicsEffect(effect)

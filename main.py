@@ -8,7 +8,8 @@
             第二阶段：任务栏吸附定位（贴任务栏左侧、自动隐藏跟随、全屏隐藏、DPI/分辨率变化重建、
             Explorer 重启找回）；
             第五阶段：设置锁持久化（vitalsring_config.json）+ 恢复默认动画 + 动态磁盘；
-            第六轮：五槽位全可配 + 动态磁盘/总盘 + 齿轮风格统一 + 制作人员署名。
+            第六轮：五槽位全可配 + 动态磁盘/总盘 + 齿轮风格统一 + 制作人员署名；
+            第七轮：环中心拟物化线条图标（CPU/GPU/内存/磁盘/总盘/电池）+ 图标/文字开关。
 安全边界：仅读取并显示系统信息，不修改任何系统设置、不写注册表、不删除文件。
 """
 from __future__ import annotations
@@ -22,9 +23,10 @@ import time
 import traceback
 from ctypes import wintypes
 
-from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer
 from PyQt6.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QPainter, QPainterPath, QPalette, QPen,
+    QBrush, QColor, QConicalGradient, QCursor, QFont, QFontMetrics,
+    QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QRadialGradient,
     QRegion, QTransform,
 )
 from PyQt6.QtWidgets import QApplication, QMenu, QWidget
@@ -33,8 +35,8 @@ from readers import ItemData, SystemReader
 from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
-# 第 6 轮起始 0.10.06.01
-APP_VERSION = "0.10.06.07"
+# 第 7 轮终极重构 0.10.07.13
+APP_VERSION = "0.10.07.13"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -443,6 +445,12 @@ class VitalPanel(QWidget):
         # 是否绘制环形刻度线：默认关闭；不持久化，重启回到默认 False。
         # 只影响两处刻度绘制（挂件小环 / 大面板大环），底环、进度弧、红叉、名称都不受影响。
         self._show_ticks = False
+        # 第 7 轮：环中心是否使用拟物化图标；默认开启，受设置锁控制持久化。
+        # 只替换中心文字，底环、刻度、进度弧、红叉与配色完全不受影响。
+        self._use_icon_style = True
+        # 第 7 轮完全体：图标风格 color=多色微拟物（默认）/ line=单色线条。
+        # 两种风格共用同一套布局与进度弧，只改变环中心图标。
+        self._icon_style = "color"
         # 挂件尺寸缓存：paintEvent 绝不调用 Win32，这里只保存最后一次算好的值
         self._widget_h = WIDGET_FALLBACK_H
         self._widget_d = self._widget_h - 10
@@ -459,10 +467,10 @@ class VitalPanel(QWidget):
         # 鼠标交互状态：拖拽移动 / 右下角调整宽度 / 点击切换
         self._dragging = False
         self._resizing = False
-        # 拖动改为增量位移：记录"上一次的全局鼠标位置"，每帧只移动两者的差值。
-        # 不用"按下时的固定 offset 做绝对定位"——跨到 DPI 比例不同的屏幕时，
-        # Qt 会按比例重算逻辑坐标，绝对定位会算出极远坐标，导致窗口跳飞。
-        self._last_global = None
+        # 0.10.07.13 按本轮指令：拖动使用固定 _drag_offset 绝对定位，
+        # 每帧 event.globalPosition() - _drag_offset 移动，不再逐帧做屏幕钳制；
+        # 松手时统一 _keep_on_screen()。若混合 DPI 跨屏出现跳飞，需回退增量方案。
+        self._drag_offset = QPoint()
         self._resize_start_x = 0.0
         self._resize_start_w = 0
         self._press_pos = None            # 按下位置，用于区分"点击"与"拖动"
@@ -859,7 +867,8 @@ class VitalPanel(QWidget):
         两种模式都要能算：绘制时用它给下方文本行定位，点击时用它判定点在哪个文本行上。
         """
         if self._list_mode:
-            return float(self.PAD + 5 * self.LIST_ROW_H)
+            # 行数按当前槽位动态计算：gear 跳过，不能写死 5 行
+            return float(self.PAD + len(self._visible_slot_keys()) * self.LIST_ROW_H)
         positions = self._ring_positions(width)
         return max(y + d + self.REASON_H for (_x, y, d) in positions)
 
@@ -873,7 +882,7 @@ class VitalPanel(QWidget):
             return int(self._widget_h)
         width = self._clamp_width(width)
         if self._list_mode:
-            block_h = 5 * self.LIST_ROW_H
+            block_h = len(self._visible_slot_keys()) * self.LIST_ROW_H
         else:
             rows, d = self._ring_grid(width)
             cell_h = d + self.REASON_H
@@ -917,8 +926,22 @@ class VitalPanel(QWidget):
                 if self._list_mode:
                     self._draw_list(painter)
                 else:
-                    for item, (x, y, d) in zip(self._reader.items, self._ring_positions(self.width())):
-                        self._draw_ring_item(painter, item, x, y, d)
+                    # 大面板与挂件使用同一套槽位配置：逐个 key 判断齿轮/数据项，
+                    # 不再固定 zip(self._reader.items) 的五项顺序。
+                    for key, (x, y, d) in zip(self._slot_keys,
+                                               self._ring_positions(self.width())):
+                        if key == "gear":
+                            # 齿轮槽位复用挂件的实心齿轮绘制，尺寸/比例完全一致；
+                            # 大面板固定使用深色面板的白环/浅字配色。
+                            self._draw_gear_icon(
+                                painter, x + d / 2.0, y + d / 2.0, d,
+                                base_color=QColor(255, 255, 255, 38),
+                                icon_color=QColor(230, 233, 238),
+                            )
+                        else:
+                            item = self._reader.slot_item(key)
+                            if item is not None:
+                                self._draw_ring_item(painter, item, x, y, d)
                 self._draw_text_rows(painter, block_bottom)
                 self._draw_gear(painter)
                 self._draw_resize_hint(painter)
@@ -936,7 +959,11 @@ class VitalPanel(QWidget):
         font.setPointSize(9)
         painter.setFont(font)
         y = float(self.PAD)
-        for item in self._reader.items:
+        # 与环形模式同一套槽位：gear 不是数据项，直接跳过不占行
+        for key in self._visible_slot_keys():
+            item = self._reader.slot_item(key)
+            if item is None:
+                continue
             if item.is_ok:
                 painter.setPen(QColor(200, 205, 212))
                 text = f"{item.name}：{int(round(item.value or 0.0))}%"
@@ -1038,30 +1065,573 @@ class VitalPanel(QWidget):
             self._draw_fail_cross(painter, cx, cy, outer, thickness,
                                   inner=max(7.0, outer * 0.45))
 
-        # 4) 中心只写名称（7pt），不出现任何数字
-        # 名称超宽时自动缩字号（例如动态磁盘/总盘），避免文字糊到环外
-        name = item.name
-        painter.setPen(text_color)
-        font = QFont()
-        font.setPointSize(7)
-        metrics = QFontMetrics(font)
-        available = max(1, int(d) - 6)
-        while font.pointSize() > 5 and metrics.horizontalAdvance(name) > available:
-            font.setPointSize(font.pointSize() - 1)
+        # 4) 环中心：图标模式且数据正常时画拟物图标；失败或未知项回退为名称文字。
+        # 失败项由调用方画红叉，这里不画图标，避免图标与红叉叠在一起看不清。
+        icon_drawn = False
+        if self._use_icon_style and item.is_ok:
+            icon_drawn = self._draw_item_icon(
+                painter, item.key, cx, cy, d, text_color, item.value)
+        if not icon_drawn:
+            # 名称超宽时自动缩字号（例如动态磁盘/总盘），避免文字糊到环外
+            name = item.name
+            painter.setPen(text_color)
+            font = QFont()
+            font.setPointSize(7)
             metrics = QFontMetrics(font)
-        painter.setFont(font)
-        painter.drawText(QRectF(x, y, d, d), Qt.AlignmentFlag.AlignCenter, name)
+            available = max(1, int(d) - 6)
+            while font.pointSize() > 5 and metrics.horizontalAdvance(name) > available:
+                font.setPointSize(font.pointSize() - 1)
+                metrics = QFontMetrics(font)
+            painter.setFont(font)
+            painter.drawText(QRectF(x, y, d, d), Qt.AlignmentFlag.AlignCenter, name)
 
-    def _draw_gear_icon(self, painter: QPainter, cx: float, cy: float, d: int) -> None:
+    def _draw_item_icon(self, painter: QPainter, key: str, cx: float, cy: float,
+                        d: int, color: QColor, value: float = None) -> bool:
+        """按当前图标风格分派：color=多色微拟物 / line=单色线条。
+
+        注意：
+        - 两个子方法必须使用完全相同的 _icon_metrics(d) 几何，只允许笔刷/填充不同，
+          因此切换风格时外框位置、宽高、内部 margins 完全一致（0 抖动）；
+        - value 仅电池使用，按真实百分比映射 3/2/1 格；
+        - disk_type 从 reader 的缓存对象读取，paintEvent 内不做任何 I/O。
+        """
+        disk_type = "ssd"
+        try:
+            item = self._reader.slot_item(key)
+            if item is not None:
+                if item.disk_type:
+                    disk_type = item.disk_type
+                # 电池：调用方漏传 value 时，回退到 reader 的真实百分比
+                if key == "battery" and value is None:
+                    value = item.value
+        except Exception:
+            disk_type = "ssd"
+        if self._icon_style == "line":
+            return self._draw_item_icon_line(
+                painter, key, cx, cy, d, color, value, disk_type)
+        return self._draw_item_icon_color(
+            painter, key, cx, cy, d, color, value, disk_type)
+
+    def _icon_metrics(self, d: int) -> dict:
+        """两种风格共用的唯一几何来源（第 7 轮 0.10.07.13 定稿）。
+
+        注意：所有结构先由 _build_icon_path 生成唯一 QPainterPath，
+        _icon_metrics 只负责提供尺寸与偏移；任何函数不得另写一套坐标。
+        """
+        s = float(d) * 0.40
+        half = s / 2.0
+        if DEBUG_LOG:
+            print(f"[icon_geom] d={d} size={s:.3f} half={half:.3f}")
+        return {
+            "s": s, "half": half,
+            # CPU
+            "cpu_r": s * 0.18,
+            "cpu_inner": s * 0.42,
+            "cpu_inner_r": s * 0.10,
+            "cpu_pin": s * 0.09,
+            "cpu_pin_off": s * 0.18,
+            # GPU
+            "gpu_w": s,
+            "gpu_h": s * 0.70,
+            "gpu_r": s * 0.12,
+            "gpu_fan": s * 0.24,
+            "gpu_axis": max(0.8, s * 0.055),
+            "gpu_fingers": 3,
+            # 0.10.07.13：外凸缩短到 0.08d，只露出一小截；竖线长度保持 0.21s
+            "gpu_finger_ext": 0.08 * d,
+            "gpu_finger_h": s * 0.21,
+            # 内存：34px 下只保留 2 个大槽 + 4 根粗金手指
+            "mem_w": s,
+            "mem_h": s * 0.42,
+            "mem_r": s * 0.08,
+            "mem_chip_w": s * 0.30,
+            "mem_chip_h": s * 0.24,
+            "mem_gap": s * 0.08,
+            "mem_slots": 2,
+            # 0.10.07.13：内存金手指外凸缩短到 0.04d
+            "mem_pin": 0.04 * d,
+            "mem_pins": 4,
+            "mem_pin_span": s * 0.70,
+            # SSD
+            "ssd_w": s,
+            "ssd_h": s * 0.40,
+            "ssd_r": s * 0.10,
+            "ssd_notch_x": s * 0.32,
+            "ssd_notch_w": s * 0.08,
+            "ssd_notch_d": s * 0.18,
+            "ssd_chip": s * 0.22,
+            "ssd_chips": 2,
+            "ssd_gap": s * 0.08,
+            # HDD：只有方框 + 同心盘片，不再画磁头臂
+            "hdd_side": s * 0.86,
+            "hdd_r": s * 0.10,
+            "hdd_plate": s * 0.28,
+            "hdd_inner": s * 0.126,
+            # C 盘标记：2.5px 实心圆点（SSD 在长条右上，HDD 在盘片中心偏右上）
+            "c_dot_r": 1.25,
+            "c_dot_ssd_dx": s * 0.30,
+            "c_dot_ssd_dy": s * 0.10,
+            "c_dot_hdd_dx": s * 0.28 * 0.30,
+            "c_dot_hdd_dy": s * 0.28 * 0.30,
+            # 总盘
+            "total_h": s * 0.34,
+            "total_off": s * 0.21,
+            # 电池
+            "bat_w": s,
+            "bat_h": s * 0.50,
+            "bat_r": s * 0.125,
+            "bat_term_w": s * 0.10,
+            "bat_term_h": s * 0.18,
+            "bat_term_r": s * 0.18 * 0.25,
+            "bat_seg_w": s * 0.16,
+            "bat_seg_h": s * 0.26,
+            "bat_seg_r": s * 0.16 * 0.28,
+            "bat_gap": s * 0.05,
+            "bat_segments": 3,
+        }
+
+    @staticmethod
+    def _battery_lit(value) -> int:
+        """真实电量映射为 3 格：>=67 → 3，>=34 → 2，>0 → 1，否则 0。"""
+        lit = 0
+        try:
+            if value is not None:
+                v = float(value)
+                if v >= 67:
+                    lit = 3
+                elif v >= 34:
+                    lit = 2
+                elif v > 0:
+                    lit = 1
+        except Exception:
+            lit = 0
+        if DEBUG_LOG:
+            print(f"[battery] value={value} lit={lit}")
+        return lit
+
+    def _build_icon_path(self, key: str, m: dict):
+        """构建该图标唯一的几何 QPainterPath（第 7 轮 0.10.07.13 核心）。
+
+        约定：
+        - 所有外框、金手指、引脚、芯片槽、小圆点、盘片、C 盘圆点全部加入同一个 Path；
+        - line 只 strokePath(path)，color 先 fillPath(path) 再 strokePath(path)；
+        - 两套风格的物理边缘因此 100% 重合，绝无重影/偏移。
+        """
+        try:
+            s, half = m["s"], m["half"]
+            cx, cy = m["cx"], m["cy"]
+            path = QPainterPath()
+            path.setFillRule(Qt.FillRule.WindingFill)
+            if key == "cpu":
+                path.addRoundedRect(
+                    QRectF(cx - half, cy - half, s, s),
+                    m["cpu_r"], m["cpu_r"])
+                inner = m["cpu_inner"]
+                path.addRoundedRect(
+                    QRectF(cx - inner / 2.0, cy - inner / 2.0, inner, inner),
+                    m["cpu_inner_r"], m["cpu_inner_r"])
+                pin, off = m["cpu_pin"], m["cpu_pin_off"]
+                for t in (-off, off):
+                    path.moveTo(cx - half - pin, cy + t)
+                    path.lineTo(cx - half, cy + t)
+                    path.moveTo(cx + half, cy + t)
+                    path.lineTo(cx + half + pin, cy + t)
+                    path.moveTo(cx + t, cy - half - pin)
+                    path.lineTo(cx + t, cy - half)
+                    path.moveTo(cx + t, cy + half)
+                    path.lineTo(cx + t, cy + half + pin)
+            elif key == "gpu":
+                gw, gh = m["gpu_w"], m["gpu_h"]
+                path.addRoundedRect(
+                    QRectF(cx - gw / 2.0, cy - gh / 2.0, gw, gh),
+                    m["gpu_r"], m["gpu_r"])
+                # 金手指在外框左侧外围：x ∈ [cx-w/2-0.15d, cx-w/2]
+                x_left = cx - gw / 2.0
+                ext, fh, n = (m["gpu_finger_ext"], m["gpu_finger_h"],
+                              m["gpu_fingers"])
+                for i in range(n):
+                    fx = x_left - ext + ext * (i + 0.5) / n
+                    path.moveTo(fx, cy - fh)
+                    path.lineTo(fx, cy + fh)
+                path.addEllipse(QPointF(cx, cy), m["gpu_fan"], m["gpu_fan"])
+                path.addEllipse(QPointF(cx, cy), m["gpu_axis"], m["gpu_axis"])
+            elif key == "mem":
+                mw, mh = m["mem_w"], m["mem_h"]
+                path.addRoundedRect(
+                    QRectF(cx - mw / 2.0, cy - mh / 2.0, mw, mh),
+                    m["mem_r"], m["mem_r"])
+                chip_w, chip_h, gap = m["mem_chip_w"], m["mem_chip_h"], m["mem_gap"]
+                slots = m["mem_slots"]
+                total = slots * chip_w + (slots - 1) * gap
+                x0 = cx - total / 2.0
+                for i in range(slots):
+                    path.addRoundedRect(
+                        QRectF(x0 + i * (chip_w + gap), cy - chip_h / 2.0,
+                               chip_w, chip_h),
+                        0.4, 0.4)
+                pin, n = m["mem_pin"], m["mem_pins"]
+                span = m["mem_pin_span"]
+                for i in range(n):
+                    px = cx + (i - (n - 1) / 2.0) * (span / (n - 1))
+                    path.moveTo(px, cy + mh / 2.0)
+                    path.lineTo(px, cy + mh / 2.0 + pin)
+            elif key == "disk_total":
+                th, off = m["total_h"], m["total_off"]
+                for oy in (-off, off):
+                    path.addRoundedRect(
+                        QRectF(cx - half, cy + oy - th / 2.0, s, th),
+                        th * 0.25, th * 0.25)
+            elif key.startswith("disk_"):
+                disk_type = "ssd"
+                try:
+                    item = self._reader.slot_item(key)
+                    if item is not None and item.disk_type:
+                        disk_type = item.disk_type
+                except Exception:
+                    disk_type = "ssd"
+                if disk_type != "hdd":
+                    sw, sh = m["ssd_w"], m["ssd_h"]
+                    path.addRoundedRect(
+                        QRectF(cx - sw / 2.0, cy - sh / 2.0, sw, sh),
+                        m["ssd_r"], m["ssd_r"])
+                    nw, nd = m["ssd_notch_w"], m["ssd_notch_d"]
+                    nx = cx + m["ssd_notch_x"]
+                    path.moveTo(nx, cy - sh / 2.0)
+                    path.lineTo(nx, cy - sh / 2.0 + nd)
+                    path.lineTo(nx + nw, cy - sh / 2.0 + nd)
+                    path.lineTo(nx + nw, cy - sh / 2.0)
+                    chip, gap = m["ssd_chip"], m["ssd_gap"]
+                    chips = m["ssd_chips"]
+                    total = chips * chip + (chips - 1) * gap
+                    x0 = cx - total / 2.0
+                    for i in range(chips):
+                        path.addRoundedRect(
+                            QRectF(x0 + i * (chip + gap), cy - chip / 2.0,
+                                   chip, chip),
+                            0.8, 0.8)
+                    if key == "disk_c":
+                        path.addEllipse(
+                            QPointF(cx + m["c_dot_ssd_dx"],
+                                    cy - m["c_dot_ssd_dy"]),
+                            m["c_dot_r"], m["c_dot_r"])
+                else:
+                    side = m["hdd_side"]
+                    path.addRoundedRect(
+                        QRectF(cx - side / 2.0, cy - side / 2.0, side, side),
+                        m["hdd_r"], m["hdd_r"])
+                    path.addEllipse(QPointF(cx, cy),
+                                    m["hdd_plate"], m["hdd_plate"])
+                    path.addEllipse(QPointF(cx, cy),
+                                    m["hdd_inner"], m["hdd_inner"])
+                    if key == "disk_c":
+                        path.addEllipse(
+                            QPointF(cx + m["c_dot_hdd_dx"],
+                                    cy - m["c_dot_hdd_dy"]),
+                            m["c_dot_r"], m["c_dot_r"])
+            elif key == "battery":
+                bw, bh = m["bat_w"], m["bat_h"]
+                path.addRoundedRect(
+                    QRectF(cx - bw / 2.0, cy - bh / 2.0, bw, bh),
+                    m["bat_r"], m["bat_r"])
+                tw, th = m["bat_term_w"], m["bat_term_h"]
+                path.addRoundedRect(
+                    QRectF(cx + bw / 2.0, cy - th / 2.0, tw, th),
+                    m["bat_term_r"], m["bat_term_r"])
+            else:
+                return None
+            return path
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def _draw_item_icon_line(self, painter: QPainter, key: str, cx: float, cy: float,
+                             d: int, color: QColor, value: float = None,
+                             disk_type: str = "ssd") -> bool:
+        """单色线条：只 strokePath 统一 Path；C 盘圆点与电池格是唯一填报例外。"""
+        saved = False
+        try:
+            m = self._icon_metrics(d)
+            m["cx"], m["cy"] = cx, cy
+            path = self._build_icon_path(key, m)
+            if path is None:
+                return False
+            pen = QPen(color, 1.2, Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            painter.save()
+            saved = True
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.strokePath(path, pen)
+            # C 盘：2.5px 实心圆点（同一几何，两种风格都填实）
+            if key == "disk_c":
+                _disk_type = disk_type
+                dot_x = (cx + m["c_dot_ssd_dx"] if _disk_type != "hdd"
+                         else cx + m["c_dot_hdd_dx"])
+                dot_y = (cy - m["c_dot_ssd_dy"] if _disk_type != "hdd"
+                         else cy - m["c_dot_hdd_dy"])
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                painter.drawEllipse(QPointF(dot_x, dot_y),
+                                    m["c_dot_r"], m["c_dot_r"])
+            elif key == "battery":
+                # 电池 3 格：点亮实心、未点亮虚线（几何来自同一组 metrics）
+                bw, bh = m["bat_w"], m["bat_h"]
+                seg_w, seg_h, gap = m["bat_seg_w"], m["bat_seg_h"], m["bat_gap"]
+                count = m["bat_segments"]
+                lit = self._battery_lit(value)
+                x0 = cx - (count * seg_w + (count - 1) * gap) / 2.0
+                for i in range(count):
+                    seg = QRectF(x0 + i * (seg_w + gap),
+                                 cy - seg_h / 2.0, seg_w, seg_h)
+                    if i < lit:
+                        # 纯白实心（不跟随主题色）
+                        painter.setPen(Qt.PenStyle.NoPen)
+                        painter.setBrush(QColor("#FFFFFF"))
+                        painter.drawRoundedRect(seg, m["bat_seg_r"],
+                                                m["bat_seg_r"])
+                    else:
+                        # 纯白虚线框
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.setPen(QPen(QColor("#FFFFFF"), 1.2,
+                                            Qt.PenStyle.DashLine,
+                                            Qt.PenCapStyle.RoundCap,
+                                            Qt.PenJoinStyle.RoundJoin))
+                        painter.drawRoundedRect(seg, m["bat_seg_r"],
+                                                m["bat_seg_r"])
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+        finally:
+            if saved:
+                painter.restore()
+
+    def _draw_item_icon_color(self, painter: QPainter, key: str, cx: float, cy: float,
+                              d: int, color: QColor, value: float = None,
+                              disk_type: str = "ssd") -> bool:
+        """多色拟物：fillPath(统一 Path) → 覆盖色块/渐变/高光 → strokePath(同一 Path)。
+
+        注意：外层描边与 line 同为 1.2px；填充/高光绝不改变 Path 几何。
+        """
+        saved = False
+        try:
+            m = self._icon_metrics(d)
+            m["cx"], m["cy"] = cx, cy
+            path = self._build_icon_path(key, m)
+            if path is None:
+                return False
+            s, half = m["s"], m["half"]
+            base = QColor(color)
+            light = base.lighter(135)
+            dark = base.darker(120)
+            highlight = QColor(255, 255, 255, 90)
+            gold = QColor("#F5C542")
+
+            def alpha(c, a):
+                out = QColor(c)
+                out.setAlpha(a)
+                return out
+
+            def linear(rect, a0=78, a1=40):
+                grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+                grad.setColorAt(0.0, alpha(light, a0))
+                grad.setColorAt(1.0, alpha(dark, a1))
+                return QBrush(grad)
+
+            def radial(center, radius, a0=78, a1=40):
+                grad = QRadialGradient(center, radius)
+                grad.setColorAt(0.0, alpha(light, a0))
+                grad.setColorAt(1.0, alpha(dark, a1))
+                return QBrush(grad)
+
+            def conical(center):
+                grad = QConicalGradient(center, 45.0)
+                grad.setColorAt(0.0, alpha(light, 80))
+                grad.setColorAt(0.25, alpha(dark, 40))
+                grad.setColorAt(0.5, alpha(light, 70))
+                grad.setColorAt(0.75, alpha(dark, 40))
+                grad.setColorAt(1.0, alpha(light, 80))
+                return QBrush(grad)
+
+            def stroke_pen(a=190, w=1.2):
+                return QPen(alpha(base, a), w, Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap,
+                            Qt.PenJoinStyle.RoundJoin)
+
+            painter.save()
+            saved = True
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+            # 1) 统一 Path 先整体填充（WindingFill 覆盖所有闭合子路径）
+            painter.fillPath(path, linear(QRectF(cx - half, cy - half, s, s)))
+
+            # 2) 逐元素覆盖色块（只改颜色，不改几何）
+            if key == "cpu":
+                inner = m["cpu_inner"]
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(radial(QPointF(cx, cy), inner * 0.65, 78, 45))
+                painter.drawRoundedRect(
+                    QRectF(cx - inner / 2.0, cy - inner / 2.0, inner, inner),
+                    m["cpu_inner_r"], m["cpu_inner_r"])
+                painter.setPen(QPen(highlight, 1.0, Qt.PenStyle.SolidLine,
+                                    Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QPointF(cx - half * 0.62, cy - half * 0.52),
+                                 QPointF(cx - half * 0.28, cy - half * 0.72))
+            elif key == "gpu":
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(radial(QPointF(cx, cy), m["gpu_fan"], 78, 40))
+                painter.drawEllipse(QPointF(cx, cy), m["gpu_fan"], m["gpu_fan"])
+                painter.setBrush(radial(QPointF(cx, cy), m["gpu_axis"], 90, 55))
+                painter.drawEllipse(QPointF(cx, cy), m["gpu_axis"], m["gpu_axis"])
+                # 3 根金手指：与 Path 完全相同的坐标，只换金色
+                fingers = QPainterPath()
+                x_left = cx - m["gpu_w"] / 2.0
+                ext, fh, n = (m["gpu_finger_ext"], m["gpu_finger_h"],
+                              m["gpu_fingers"])
+                for i in range(n):
+                    fx = x_left - ext + ext * (i + 0.5) / n
+                    fingers.moveTo(fx, cy - fh)
+                    fingers.lineTo(fx, cy + fh)
+                painter.strokePath(
+                    fingers,
+                    QPen(gold, 1.2, Qt.PenStyle.SolidLine,
+                         Qt.PenCapStyle.RoundCap))
+                painter.setPen(QPen(highlight, 1.0, Qt.PenStyle.SolidLine,
+                                    Qt.PenCapStyle.RoundCap))
+                painter.drawArc(
+                    QRectF(cx - m["gpu_fan"], cy - m["gpu_fan"],
+                           2 * m["gpu_fan"], 2 * m["gpu_fan"]),
+                    60 * 16, 70 * 16)
+            elif key == "mem":
+                chip_w, chip_h, gap = (m["mem_chip_w"], m["mem_chip_h"],
+                                       m["mem_gap"])
+                slots = m["mem_slots"]
+                total = slots * chip_w + (slots - 1) * gap
+                x0 = cx - total / 2.0
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(8, 10, 14, 210))
+                for i in range(slots):
+                    painter.drawRoundedRect(
+                        QRectF(x0 + i * (chip_w + gap), cy - chip_h / 2.0,
+                               chip_w, chip_h),
+                        0.4, 0.4)
+                pins = QPainterPath()
+                pin, n = m["mem_pin"], m["mem_pins"]
+                span = m["mem_pin_span"]
+                for i in range(n):
+                    px = cx + (i - (n - 1) / 2.0) * (span / (n - 1))
+                    pins.moveTo(px, cy + m["mem_h"] / 2.0)
+                    pins.lineTo(px, cy + m["mem_h"] / 2.0 + pin)
+                painter.strokePath(
+                    pins,
+                    QPen(gold, 1.2, Qt.PenStyle.SolidLine,
+                         Qt.PenCapStyle.RoundCap))
+                painter.setPen(QPen(highlight, 1.0, Qt.PenStyle.SolidLine,
+                                    Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QPointF(cx - m["mem_w"] * 0.38,
+                                         cy - m["mem_h"] * 0.32),
+                                 QPointF(cx - m["mem_w"] * 0.08,
+                                         cy - m["mem_h"] * 0.32))
+            elif key == "disk_total":
+                th, off = m["total_h"], m["total_off"]
+                painter.setPen(QPen(highlight, 1.0, Qt.PenStyle.SolidLine,
+                                    Qt.PenCapStyle.RoundCap))
+                for oy in (-off, off):
+                    painter.drawLine(
+                        QPointF(cx - s * 0.38, cy + oy - th * 0.12),
+                        QPointF(cx - s * 0.08, cy + oy - th * 0.12))
+            elif key.startswith("disk_"):
+                if disk_type != "hdd":
+                    chip, gap = m["ssd_chip"], m["ssd_gap"]
+                    chips = m["ssd_chips"]
+                    total = chips * chip + (chips - 1) * gap
+                    x0 = cx - total / 2.0
+                    for i in range(chips):
+                        chip_rect = QRectF(x0 + i * (chip + gap),
+                                           cy - chip / 2.0, chip, chip)
+                        painter.setPen(Qt.PenStyle.NoPen)
+                        painter.setBrush(radial(chip_rect.center(),
+                                                chip * 0.7, 75, 50))
+                        painter.drawRoundedRect(chip_rect, 0.8, 0.8)
+                    if key == "disk_c":
+                        painter.setPen(Qt.PenStyle.NoPen)
+                        painter.setBrush(alpha(base, 230))
+                        painter.drawEllipse(
+                            QPointF(cx + m["c_dot_ssd_dx"],
+                                    cy - m["c_dot_ssd_dy"]),
+                            m["c_dot_r"], m["c_dot_r"])
+                else:
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(conical(QPointF(cx, cy)))
+                    painter.drawEllipse(QPointF(cx, cy),
+                                        m["hdd_plate"], m["hdd_plate"])
+                    painter.setBrush(QBrush(alpha(light, 75)))
+                    painter.drawEllipse(QPointF(cx, cy),
+                                        m["hdd_inner"], m["hdd_inner"])
+                    if key == "disk_c":
+                        painter.setBrush(alpha(base, 230))
+                        painter.drawEllipse(
+                            QPointF(cx + m["c_dot_hdd_dx"],
+                                    cy - m["c_dot_hdd_dy"]),
+                            m["c_dot_r"], m["c_dot_r"])
+            elif key == "battery":
+                bw, bh = m["bat_w"], m["bat_h"]
+                seg_w, seg_h, gap = m["bat_seg_w"], m["bat_seg_h"], m["bat_gap"]
+                count = m["bat_segments"]
+                lit = self._battery_lit(value)
+                x0 = cx - (count * seg_w + (count - 1) * gap) / 2.0
+                for i in range(count):
+                    seg = QRectF(x0 + i * (seg_w + gap),
+                                 cy - seg_h / 2.0, seg_w, seg_h)
+                    if i < lit:
+                        grad = QRadialGradient(seg.center(), seg_w * 0.75)
+                        grad.setColorAt(0.0, QColor(134, 239, 172, 240))
+                        grad.setColorAt(0.6, QColor(74, 222, 128, 225))
+                        grad.setColorAt(1.0, QColor(34, 197, 94, 210))
+                        painter.setPen(Qt.PenStyle.NoPen)
+                        painter.setBrush(QBrush(grad))
+                    else:
+                        painter.setPen(QPen(alpha(base, 150), 1.2,
+                                            Qt.PenStyle.DashLine,
+                                            Qt.PenCapStyle.RoundCap,
+                                            Qt.PenJoinStyle.RoundJoin))
+                        painter.setBrush(QBrush(QColor(70, 76, 88, 120)))
+                    painter.drawRoundedRect(seg, m["bat_seg_r"],
+                                            m["bat_seg_r"])
+                painter.setPen(QPen(highlight, 1.0, Qt.PenStyle.SolidLine,
+                                    Qt.PenCapStyle.RoundCap))
+                painter.drawLine(QPointF(cx - bw * 0.32, cy - bh * 0.30),
+                                 QPointF(cx - bw * 0.08, cy - bh * 0.30))
+
+            # 3) 统一 Path 最后描边：与 line 完全相同的 1.2px 外沿
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.strokePath(path, stroke_pen())
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+        finally:
+            if saved:
+                painter.restore()
+
+    def _draw_gear_icon(self, painter: QPainter, cx: float, cy: float, d: int,
+                        base_color: QColor = None,
+                        icon_color: QColor = None) -> None:
         """画齿轮位：与数据环完全相同的灰色底环 + 缩小到 55% 的实心齿轮。
 
         做法：齿轮主体圆 + 8 个旋转圆角矩形齿做路径合并，先减去内圈镂空、
         再减中心孔，最后实心填充。不要用线段拼齿（小尺寸下会变成蜘蛛网）。
         齿轮是按钮不是数据环，只画图形不写文字，避免和数据环的名称混淆。
-        颜色、粗细、底环全部复用 _widget_ring_style()，不再另写一套。
+        颜色、粗细、底环默认复用 _widget_ring_style()；大面板调用时可传入
+        固定的面板环配色，保证深色面板上齿轮不会因系统浅色主题而变暗。
         """
         base_ring_color, _tick_color, text_color, thickness, _outer, r_mid = \
             self._widget_ring_style(d)
+        if base_color is not None:
+            base_ring_color = base_color
+        if icon_color is not None:
+            text_color = icon_color
 
         # 1) 底环：与数据环完全同一套颜色/粗细
         painter.save()
@@ -1137,6 +1707,57 @@ class VitalPanel(QWidget):
         """供设置窗口读取当前刻度开关状态。"""
         return bool(self._show_ticks)
 
+    def set_use_icon_style(self, enabled: bool) -> None:
+        """设置窗口「使用拟物化图标」复选框的入口。
+
+        注意：只改中心绘制方式，不重建控件、不改尺寸；
+        与刻度开关一样受设置锁控制——锁上时立即落盘，解锁时只在本次运行生效。
+        """
+        try:
+            enabled = bool(enabled)
+            changed = enabled != self._use_icon_style
+            self._use_icon_style = enabled
+            # 即使值没有变化也强制重绘，避免"取消勾选后画面没反应"的假象；
+            # 这里不做任何锁/调试模式拦截，锁只影响是否落盘，不影响本次绘制。
+            self.update()
+            if self._settings is not None:
+                self._settings.sync_icon_style()
+            if DEBUG_LOG:
+                print(f"[icon] use_icon_style={enabled} changed={changed}")
+            if changed:
+                self._persist_if_locked()
+        except Exception:
+            traceback.print_exc()
+
+    def use_icon_style_enabled(self) -> bool:
+        """供设置窗口读取当前是图标模式还是文字模式。"""
+        return bool(self._use_icon_style)
+
+    def set_icon_style(self, style: str) -> None:
+        """设置窗口「图标风格」下拉入口：color=多色拟物 / line=单色线条。
+
+        注意：只改环中心绘制方式，不重建控件、不改尺寸；
+        与图标开关、刻度开关一样受设置锁控制——锁上时立即落盘，
+        解锁时只在本次运行生效，重启回到默认 color。
+        """
+        try:
+            style = style if style in ("color", "line") else "color"
+            changed = style != self._icon_style
+            self._icon_style = style
+            self.update()
+            if self._settings is not None:
+                self._settings.sync_icon_style()
+            if DEBUG_LOG:
+                print(f"[icon] icon_style={style} changed={changed}")
+            if changed:
+                self._persist_if_locked()
+        except Exception:
+            traceback.print_exc()
+
+    def icon_style(self) -> str:
+        """供设置窗口读取当前图标风格（color / line）。"""
+        return self._icon_style
+
     # ------------------------------------------------------------------ 设置持久化（锁）
 
     def _load_config(self) -> None:
@@ -1147,6 +1768,8 @@ class VitalPanel(QWidget):
         - slot_keys 必须严格校验（长度 5、全部在动态池内、互不相同），非法就整组回默认；
         - 调试模式永远不保存、不读取。
         """
+        # 死命令：配置缺失/损坏/未锁定时，图标风格一律回退到多色
+        self._icon_style = "color"
         self._lock_state = False
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
@@ -1165,6 +1788,14 @@ class VitalPanel(QWidget):
         ticks = data.get("show_ticks")
         if isinstance(ticks, bool):
             self._show_ticks = ticks
+        # 图标/文字开关：与刻度开关同受锁控制；字段缺失或类型非法时保持默认 True
+        icons = data.get("use_icon_style")
+        if isinstance(icons, bool):
+            self._use_icon_style = icons
+        # 图标风格：只接受 color / line，其它值一律回默认多色
+        style = data.get("icon_style")
+        if style in ("color", "line"):
+            self._icon_style = style
         keys = data.get("slot_keys")
         if self._is_valid_slot_config(keys):
             self._slot_keys = list(keys)
@@ -1182,6 +1813,8 @@ class VitalPanel(QWidget):
             payload = {
                 "layout_mode": self._layout_mode,
                 "show_ticks": bool(self._show_ticks),
+                "use_icon_style": bool(self._use_icon_style),
+                "icon_style": self._icon_style,
                 "slot_keys": list(self._slot_keys),
                 "lock_state": bool(self._lock_state),
             }
@@ -1264,6 +1897,8 @@ class VitalPanel(QWidget):
             self.set_settings_locked(False)
             self.set_layout_mode("widget")
             self.set_show_ticks(False)
+            self.set_use_icon_style(True)     # 图标模式是默认值，恢复默认必须回到开启
+            self.set_icon_style("color")      # 多色微拟物是默认风格
             self.set_slot_config(list(DEFAULT_SLOT_KEYS))
             self.set_auto_dock(True)
             # 检测开关全部恢复开启（动态磁盘项不在 enabled 字典里，默认就是开启）
@@ -1416,8 +2051,16 @@ class VitalPanel(QWidget):
         return self._layout_mode
 
     def slot_keys(self) -> list:
-        """挂件五环槽位的当前配置（副本，避免外部直接改动内部列表）。"""
+        """挂件/大面板五槽位的当前配置（副本，避免外部直接改动内部列表）。"""
         return list(self._slot_keys)
+
+    def _visible_slot_keys(self) -> list:
+        """大面板文字列表实际显示的数据槽位；gear 不是数据项，必须跳过。
+
+        注意：文字列表高度与点击区域都依赖这个数量，不能写死 5 行，
+        否则配置齿轮后会出现一行空白，并把下方文本区顶偏。
+        """
+        return [key for key in self._slot_keys if key != "gear"]
 
     def _widget_width_for(self, height: int) -> int:
         """按挂件高度算固定宽度：5 个环 + 4 个间距 + 两侧留白。"""
@@ -1520,7 +2163,7 @@ class VitalPanel(QWidget):
             traceback.print_exc()
 
     def set_slot_config(self, keys) -> bool:
-        """校验并应用挂件五槽位配置；校验失败返回 False 且不改变当前配置。
+        """校验并应用挂件/大面板五槽位配置；校验失败返回 False 且不改变当前配置。
 
         规则（第六轮）：长度 5；每一项都必须在动态池内（含动态磁盘与 gear）；
         五项互不相同。没有固定位，任何槽位都可以放齿轮或任意数据项。
@@ -1531,6 +2174,12 @@ class VitalPanel(QWidget):
             self._slot_keys = list(keys)
             if self._settings is not None:
                 self._settings.sync_slot_combos()
+            # 大面板文字列表的行数取决于是否存在 gear 槽，变更后必须重算高度；
+            # 否则会出现空白行或文本区错位。挂件模式高度固定，不需要 resize。
+            if self._layout_mode == "panel":
+                w = self._clamp_width(self.width())
+                self.resize(w, self.heightForWidth(w))
+                self._keep_on_screen()
             self.update()
             self._persist_if_locked()      # 锁上时立即保存槽位
             return True
@@ -1549,6 +2198,15 @@ class VitalPanel(QWidget):
         数百毫秒，导致 120ms 与 500ms 两枪实际只相隔几十毫秒而被去重吞掉；
         延迟枪本来就是刻意安排的，绕过去重才能保证"三次都生效"。
         """
+        # 弹出层保护（第 7 轮致命 Bug 修复）：
+        # QMenu / QComboBox 的弹出层是独立的顶层窗口，模态对话框同理。
+        # 它们显示期间若执行 SetWindowPos(HWND_TOPMOST)，会把弹出层顶到挂件下面，
+        # 表现为右键菜单一闪而过、下拉框一碰就收。这里必须直接放弃本次置顶。
+        if (QApplication.activePopupWidget() is not None
+                or QApplication.activeModalWidget() is not None):
+            if DEBUG_LOG:
+                print("[raise] 检测到弹出菜单/下拉框或模态窗口，跳过本次置顶")
+            return
         if self._layout_mode != "widget":
             return
         try:
@@ -1926,12 +2584,19 @@ class VitalPanel(QWidget):
         else:
             self._draw_fail_cross(painter, cx, cy, outer, thickness)
 
-        # 4) 环中心只显示项目名称：环形区域内不得出现任何数字字符
-        painter.setPen(QColor(230, 233, 238))
-        font = QFont()
-        font.setPointSize(9)
-        painter.setFont(font)
-        painter.drawText(QRectF(x, y, d, d), Qt.AlignmentFlag.AlignCenter, item.name)
+        # 4) 环中心：与挂件完全同一套逻辑——图标模式下正常数据画图标，否则回退名称文字。
+        # 环形区域内不得出现任何数字字符；失败项已在上面画红叉，这里不再画图标。
+        text_color = QColor(230, 233, 238)
+        icon_drawn = False
+        if self._use_icon_style and item.is_ok:
+            icon_drawn = self._draw_item_icon(
+                painter, item.key, cx, cy, d, text_color, item.value)
+        if not icon_drawn:
+            painter.setPen(text_color)
+            font = QFont()
+            font.setPointSize(9)
+            painter.setFont(font)
+            painter.drawText(QRectF(x, y, d, d), Qt.AlignmentFlag.AlignCenter, item.name)
 
         # 5) 失败原因显示在环下方；正常项不显示
         if not item.is_ok:
@@ -2103,8 +2768,8 @@ class VitalPanel(QWidget):
                 self._resize_start_w = self.width()
                 return
             self._dragging = True
-            # 记录按下时的全局鼠标位置，后续拖动只累加相邻两次位置的差值
-            self._last_global = event.globalPosition().toPoint()
+            # 0.10.07.13：记录鼠标与窗口左上角的固定 offset
+            self._drag_offset = event.globalPosition().toPoint() - self.pos()
             self._pending_action = self._hit_action(pos)
         except Exception:
             # PyQt6 里事件处理函数抛未捕获异常会直接终止进程，表现就是"窗口闪一下消失"
@@ -2143,30 +2808,19 @@ class VitalPanel(QWidget):
                 moved = event.position() - self._press_pos
                 if abs(moved.x()) + abs(moved.y()) > self.CLICK_SLOP:
                     self._moved = True        # 位移超过阈值：判定为拖动，本次不再执行点击动作
-                    # 这里只"判定为拖动"，先不解除吸附：本帧的位移可能被
-                    # _target_still_visible() 拦下（窗口其实一动没动），
-                    # 那种情况下解除吸附会让背景瞬间变不透明，松手也不再是吸附态。
-                    # 真正移动成功后再解除吸附（见下方 move 之前）。
+                    # 0.10.07.13：位移超过阈值即判定为拖动，本帧开始移动时解除吸附；
+                    # 松手后由 4 秒 tick 自动吸回任务栏。
                     if DEBUG_LOG:
                         print(f"[drag] 开始 pos=({self.x()},{self.y()}) "
                               f"dpr={self.devicePixelRatioF():.2f}")
-            if not self._moved or self._last_global is None:
+            if not self._moved:
                 return
-            # 必须用增量位移，而不是"固定 offset + 绝对定位"：
-            # 窗口跨到 DPI 比例不同的屏幕时，Qt 会按比例重算逻辑坐标，
-            # 绝对定位会算出极远坐标、导致窗口跳飞（现象就是闪一下后消失）。
-            cur = event.globalPosition().toPoint()
-            delta = cur - self._last_global
-            self._last_global = cur          # 先更新基准：即使这一帧被丢弃，位移也不会累积成下一次跳跃
-            target = self.pos() + delta
-            # 混合 DPI 下这里只判断"是否允许这一帧位移"，不搬窗口、不做坐标换算，
-            # 避免再次出现跨屏坐标错乱；判断标准是目标位置仍与某块屏幕有足够交集。
-            if self._target_still_visible(target):
-                # 窗口真的开始移动了，才解除当前吸附（不修改用户的吸附勾选）。
-                # 松手后 4 秒 tick 会自动吸回；想永久不吸附请去设置里取消勾选。
-                if self._docked:
-                    self._undock_for_drag()
-                self.move(target)
+            # 0.10.07.13 按本轮指令：每帧严格用 globalPosition - _drag_offset 绝对定位，
+            # 不做逐帧 _keep_on_screen / 可视性判断；松手时再收回屏幕一次。
+            target = event.globalPosition().toPoint() - self._drag_offset
+            if self._docked:
+                self._undock_for_drag()
+            self.move(target)
         except Exception:
             # PyQt6 里事件处理函数抛未捕获异常会直接终止进程，表现就是"窗口闪一下消失"
             traceback.print_exc()
@@ -2224,7 +2878,8 @@ class VitalPanel(QWidget):
         - 命中齿轮槽（槽位配置为 "gear"）→ "settings"，直接打开/收起设置窗口；
         - 命中其它数据环或环间缝隙 → "detail"，弹详情窗口。
         大面板模式：
-        - 齿轮 → "settings"；环/文字列表 → "mode"；两个文本行 → "boot"/"os"。
+        - 右下角齿轮按钮或齿轮槽位 → "settings"；
+        - 数据环、文字列表或空白处 → "mode"；两个文本行 → "boot"/"os"。
         """
         if self._layout_mode == "widget":
             for idx, (x, y, d) in enumerate(self._widget_ring_positions()):
@@ -2235,14 +2890,18 @@ class VitalPanel(QWidget):
         width = self.width()
         if self._gear_rect().contains(QPointF(pos.x(), pos.y())):
             return "settings"
+        positions = self._ring_positions(width)
         if self._list_mode:
+            # 行数按槽位动态计算（gear 跳过），与 _block_bottom / heightForWidth 一致
+            rows = len(self._visible_slot_keys())
             if (self.PAD <= pos.x() <= width - self.PAD
-                    and self.PAD <= pos.y() <= self.PAD + 5 * self.LIST_ROW_H):
+                    and self.PAD <= pos.y() <= self.PAD + rows * self.LIST_ROW_H):
                 return "mode"
         else:
-            for (x, y, d) in self._ring_positions(width):
+            # 大面板同样按槽位判定：齿轮槽打开设置，其它数据环切换文字列表
+            for idx, (x, y, d) in enumerate(positions):
                 if x <= pos.x() <= x + d and y <= pos.y() <= y + d + self.REASON_H:
-                    return "mode"
+                    return "settings" if self._slot_keys[idx] == "gear" else "mode"
         block_bottom = self._block_bottom(width)
         text_top = block_bottom + self.SECTION_GAP
         if self.PAD <= pos.x() <= width - self.PAD:
@@ -2250,7 +2909,8 @@ class VitalPanel(QWidget):
                 return "boot"
             if text_top + self.TEXT_H <= pos.y() <= text_top + 2 * self.TEXT_H:
                 return "os"
-        return None
+        # 大面板空白处也按"切换文字列表"处理（需求指定）
+        return "mode"
 
     def _apply_action(self, action) -> None:
         """执行一次点击动作：打开设置窗口、切换环形/文字模式，或折叠某个文本行。
@@ -2306,21 +2966,24 @@ class VitalPanel(QWidget):
             # 再按"显示后的真实尺寸"摆放——实测 show() 会让窗口位置偏移约 31px，
             # 先在 show 前摆放会被这一步带偏，最终压住挂件甚至超出可用区。
             sw.prepare_for_show()
+            # 0.10.07.13：先透明显示→贴底定位→再启动弹入动画，避免旧位置残影
+            sw.setWindowOpacity(0.0)
             sw.show()
             self._place_settings_window(sw)
             sw.raise_()
             sw.activateWindow()
+            sw.start_open_animation()
             # 设置窗口出现后可能压住挂件，这里把挂件重新抬回任务栏之上
             self._raise_above_taskbar()
         except Exception:
             traceback.print_exc()
 
     def _place_settings_window(self, sw) -> None:
-        """把设置窗口摆到挂件附近，保证不与挂件矩形重叠、且完整落在可用区域内。
+        """0.10.07.13：设置窗口固定贴屏幕右下，底边紧贴任务栏上沿。
 
-        顺序：正上方 → 正下方 → 贴右边缘。优先上方/下方是为了让挂件继续可见；
-        三个位置都放不下（低分辨率 + 高窗口）时，依次钳制进屏幕并按重叠面积取最小者，
-        实在避不开才允许轻微重叠——剩余空间物理上放不下整个窗口时无法两全。
+        注意：Qt 的 move() 定位的是含标题栏的边框，而 geometry() 是客户区；
+        实测纵向差一个标题栏高度，所以 y 要先减去 off_y，
+        才能保证 sw.geometry().bottom() == area.bottom()。
         """
         try:
             screen = self.screen() or QApplication.primaryScreen()
@@ -2328,45 +2991,16 @@ class VitalPanel(QWidget):
                 return
             area = screen.availableGeometry()
             w, h = sw.width(), sw.height()
-            gap = 8
-            fx, fy, fw, fh = self.x(), self.y(), self.width(), self.height()
-            # Qt 顶层窗口的 move() 定位的是"含标题栏的边框"，而 geometry() 报告的是客户区，
-            # 实测纵向相差一个标题栏高度（本机 31px）。下面统一按客户区计算位置，
-            # 最后把这段偏移补回去，否则整窗会往下偏 31px，压住任务栏上的挂件。
-            off_x = sw.geometry().x() - sw.pos().x()
             off_y = sw.geometry().y() - sw.pos().y()
-            # 挂件贴在屏幕左边缘时，"以挂件为中心"会让 470 宽的设置窗口跑到屏幕外，
-            # 所以先用可用区把 x 钳制回来，再判断这个候选位置合不合用。
-            left_x = max(area.left(), min(fx + (fw - w) // 2, area.right() - w + 1))
-            candidates = [
-                (left_x, fy - h - gap),                       # 正上方
-                (left_x, fy + fh + gap),                      # 正下方
-                (area.right() - w + 1,                       # 贴右边缘
-                 max(area.top() + off_y,
-                     min(fy + (fh - h) // 2, area.bottom() - h + 1))),
-            ]
-            chosen = None
-            for cx, cy in candidates:
-                if (cx >= area.left() and cx + w <= area.right() + 1
-                        and cy - off_y >= area.top() and cy + h <= area.bottom() + 1
-                        and not self._rects_overlap(cx, cy, w, h, fx, fy, fw, fh)):
-                    chosen = (cx, cy)
-                    break
-            if chosen is None:
-                best = None
-                for cx, cy in candidates:
-                    cx = max(area.left(), min(cx, area.right() - w + 1))
-                    cy = max(area.top() + off_y, min(cy, area.bottom() - h + 1))
-                    # 重叠面积 = 相交矩形宽 × 高；0 表示完全不压住挂件
-                    ox = max(0, min(cx + w, fx + fw) - max(cx, fx))
-                    oy = max(0, min(cy + h, fy + fh) - max(cy, fy))
-                    score = ox * oy
-                    if best is None or score < best[0]:
-                        best = (score, cx, cy)
-                    if score == 0:
-                        break
-                chosen = (best[1], best[2])
-            sw.move(chosen[0] - off_x, chosen[1] - off_y)
+            x = max(area.left() + 16, area.right() - w - 16)
+            y = area.bottom() - h + 1 - off_y
+            if y < area.top():
+                y = area.top()
+            sw.move(x, y)
+            if DEBUG_LOG:
+                print(f"[settings] geometry={sw.geometry()} "
+                      f"area.bottom={area.bottom()} "
+                      f"window.bottom={sw.geometry().bottom()}")
         except Exception:
             traceback.print_exc()
 
@@ -2394,6 +3028,10 @@ class VitalPanel(QWidget):
         """
         try:
             menu = self._widget_menu if self._layout_mode == "widget" else self._menu
+            # 右键菜单强制置顶：挂件本身是 Tool + 置顶窗口，菜单不置顶会被它压住，
+            # 表现为菜单弹出来却点不到任何菜单项。
+            menu.setWindowFlags(
+                menu.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
             menu.exec(event.globalPos())
         except Exception:
             # 同上：事件处理函数异常不能让它把进程带崩
