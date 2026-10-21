@@ -1,34 +1,54 @@
 # -*- coding: utf-8 -*-
-"""VitalsRing（环脉）主窗口 —— 第一阶段（第 1～4 轮）+ 第二阶段（任务栏吸附）。
+"""VitalsRing（环脉）主窗口 —— 第一阶段（第 1～4 轮）+ 第二阶段（任务栏吸附）+ 第六轮。
 
 已完成范围：无边框置顶小窗 + 五个 QPainter 自绘环 + 两个文本行 + 失败红叉 + 版本号（第 1 轮）；
             点击环形/文字列表互切 + 两个文本行折叠展开（第 2 轮）；
-            设置窗口 + 调试模式 + 五项调试值 + 五项检测开关 + GitHub 预留按钮（第 3 轮）；
+            设置窗口 + 调试模式 + 各项调试值 + 各项检测开关 + GitHub 按钮（第 3 轮）；
             背景半透明降级 + 白条修复（背景画满整矩形 + 不透明遮罩裁角）（第 4 轮）；
             第二阶段：任务栏吸附定位（贴任务栏左侧、自动隐藏跟随、全屏隐藏、DPI/分辨率变化重建、
-            Explorer 重启找回）。
+            Explorer 重启找回）；
+            第五阶段：设置锁持久化（vitalsring_config.json）+ 恢复默认动画 + 动态磁盘；
+            第六轮：五槽位全可配 + 动态磁盘/总盘 + 齿轮风格统一 + 制作人员署名。
 安全边界：仅读取并显示系统信息，不修改任何系统设置、不写注册表、不删除文件。
 """
 from __future__ import annotations
 
 import ctypes
+import json
 import math
+import os
 import sys
+import time
 import traceback
 from ctypes import wintypes
 
 from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
-from PyQt6.QtGui import QColor, QCursor, QFont, QPainter, QPainterPath, QPen, QRegion
+from PyQt6.QtGui import (
+    QColor, QCursor, QFont, QFontMetrics, QPainter, QPainterPath, QPalette, QPen,
+    QRegion, QTransform,
+)
 from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
 from readers import ItemData, SystemReader
 from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
-# 第 4 轮起始 0.10.04.01，本轮内每次按反馈修改第四位递增
-APP_VERSION = "0.10.05.02"
+# 第 6 轮起始 0.10.06.01
+APP_VERSION = "0.10.06.07"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
+
+# 制作人员署名（设置窗口"关于"区与 README 共用）
+CREDITS = [
+    ("发起与全局引导", "@BTLurenJun"),
+    ("AI 架构与辅助设计", "鲸鱼（Whale）"),
+    ("代码实现", "闪电（Flash）"),
+    ("代码审查", "大白鲨（Shark）"),
+]
+
+# 第六轮：设置持久化文件（项目根目录；已加入 .gitignore，绝不入库）
+CONFIG_FILENAME = "vitalsring_config.json"
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME)
 
 # 调试日志总开关：发布版保持 False，避免带控制台的 python.exe 每次刷新都刷屏。
 # 排查"窗口闪一下消失"这类问题时，临时改成 True 即可看到拖动/显示/隐藏的轨迹。
@@ -130,15 +150,9 @@ WIDGET_RING_GAP = 3                # 挂件里环与环之间的间距
 WIDGET_PAD = 3                     # 挂件内容与边缘的留白
 WIDGET_FALLBACK_H = 44             # 定位失败时的兜底高度（保持 188×44 的小条形态）
 
-# 挂件五环槽位：0/2/4 固定，1/3 可配（3 选 2、不重复）
-FIXED_SLOTS = {0: "cpu", 2: "gpu", 4: "settings"}
-CONFIGURABLE_SLOTS = (1, 3)
-SLOT_POOL = ("mem", "disk", "battery")
-SLOT_LABELS = {
-    "cpu": "CPU", "mem": "内存", "gpu": "GPU",
-    "disk": "C盘", "battery": "电池", "settings": "设置",
-}
-DEFAULT_SLOT_KEYS = ["cpu", "mem", "gpu", "disk", "settings"]
+# 挂件五槽位全部可配：可用项由 readers.py 动态提供（含 gear），默认 CPU/GPU/内存/C盘/齿轮
+# 注意：这里不再保留固定槽位或写死的候选池，校验一律走 reader.available_slot_keys()
+DEFAULT_SLOT_KEYS = ["cpu", "gpu", "mem", "disk_c", "gear"]
 
 # SetWindowPos 常用标志位（层级修复用）
 SWP_NOSIZE = 0x0001
@@ -422,8 +436,13 @@ class VitalPanel(QWidget):
         # ---- 界面模式：默认挂件（widget），可切大面板（panel）；不持久化 ----
         self._layout_mode = "widget"
         self._switching_mode = False               # 切换模式防重入
-        # ---- 挂件五环槽位：0/2/4 固定，1/3 可配；不持久化，重启回默认 ----
+        # 吸附状态必须先于"背景模式"初始化：_apply_background_mode() 会读它判断是否能透明
+        self._docked = False
+        # ---- 挂件五环槽位：0/2 固定 CPU/GPU，1/3/4 从池中 4 选 3；不持久化，重启回默认
         self._slot_keys = list(DEFAULT_SLOT_KEYS)
+        # 是否绘制环形刻度线：默认关闭；不持久化，重启回到默认 False。
+        # 只影响两处刻度绘制（挂件小环 / 大面板大环），底环、进度弧、红叉、名称都不受影响。
+        self._show_ticks = False
         # 挂件尺寸缓存：paintEvent 绝不调用 Win32，这里只保存最后一次算好的值
         self._widget_h = WIDGET_FALLBACK_H
         self._widget_d = self._widget_h - 10
@@ -432,6 +451,11 @@ class VitalPanel(QWidget):
         # 前台事件钩子：句柄与回调对象都必须保存在实例上，回调对象一旦被 GC 会变成野指针
         self._win_event_hook = None
         self._win_event_proc = None
+        # 置顶去重时间戳：同一秒内重复调用直接跳过，避免一次点击触发多次 SetWindowPos
+        self._last_raise_ts = 0.0
+        # 是否使用全透明背景：由 _apply_background_mode() 计算并缓存，
+        # paintEvent 只读这个标志（保证绘制里零 Win32 调用）
+        self._widget_transparent_flag = False
         # 鼠标交互状态：拖拽移动 / 右下角调整宽度 / 点击切换
         self._dragging = False
         self._resizing = False
@@ -449,6 +473,8 @@ class VitalPanel(QWidget):
         self._boot_collapsed = False      # "开机时长"是否已折叠（只留标题）
         self._os_collapsed = False        # "系统版本"是否已折叠（只留标题）
         self._settings = None             # 设置窗口实例（懒创建、复用，避免每次点击都新建对象）
+        # 设置锁：True = 修改后立即写 JSON、重启保留；False = 只留内存、重启回默认
+        self._lock_state = False
         # 窗口尺寸/位置的自保标志
         self._fixing_size = False         # 防重入：避免 resizeEvent 里再 resize 造成无限递归
 
@@ -476,15 +502,20 @@ class VitalPanel(QWidget):
         # 背景取色只在启动时做一次并缓存（不做高频重复取色）
         self._bg_color = _resolve_system_bg_color()
         self._translucent = False
-        if not FORCE_OPAQUE_BACKGROUND and _dwm_composition_enabled():
+        # 系统合成是否开启：只有它为 False 时挂件才需要退回不透明深色兜底（透明会变黑）
+        self._composition_ok = _dwm_composition_enabled()
+        # 挂件明暗主题缓存：用 Qt 调色板判断，不读注册表；用于环内文字/底环/刻度配色
+        self._widget_light = self._compute_is_light()
+        # 透明背景属性必须在 show() 之前设置（Qt 文档要求）。
+        # 之后切换模式不再改这个属性，只通过"画不画背景 + 要不要遮罩"来区分两种模式，
+        # 避免运行期改 WA_TranslucentBackground 导致窗口变黑/需要重建原生窗口。
+        if self._composition_ok:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            # 注意：不能拿 testAttribute() 当"检测"——属性刚设完必然返回 True，等于没检测。
-            # 真正的降级只有两条：DWM 合成检查不通过，或 FORCE_OPAQUE_BACKGROUND 开关打开。
-            self._translucent = True
-        else:
-            # 不透明兜底：关掉系统背景擦除，避免窗口首次显示时闪一下默认白底/灰底。
-            # 背景完全由 _draw_background() 自己画，不会再露出系统底色。
-            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # 关掉系统背景擦除：背景完全由绘制代码决定，避免首帧闪白底/灰底。
+        # 注意：绝不能把 WA_NoSystemBackground 设为 False —— 实测会破坏透明，整窗变成不透明。
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # 按当前模式套用透明背景与遮罩（默认挂件 → 全透明、无遮罩）
+        self._apply_background_mode()
         # 原生样式兜底只做一次（showEvent 中调用），这里先置标志
         self._native_style_applied = False
 
@@ -518,13 +549,12 @@ class VitalPanel(QWidget):
 
         # ---- 界面模式：默认挂件（widget），可切大面板（panel）；不持久化 ----
         self._switching_mode = False               # 切换模式防重入
-        # ---- 挂件五环槽位：0/2/4 固定，1/3 可配；不持久化，重启回默认 ----
-        # （这两个状态在 __init__ 开头已初始化，这里不再重复赋值）
-        # 前台事件钩子：句柄与回调对象都必须保存在实例上，回调对象一旦被 GC 会变成野指针
-        self._win_event_hook = None
-        self._win_event_proc = None
+        # 挂件五环槽位与钩子状态已在 __init__ 开头初始化，这里不再重复赋值
 
         # ---- 第二阶段：任务栏吸附状态（不持久化，重启回到默认勾选）----
+        # 注意：_auto_dock_enabled 是"用户设置"，只有两条路径可以改它：
+        #       ① 用户在设置窗口勾选/取消；② AUTO_DOCK_ENABLED = False 的全局开关。
+        #       切模式、拖动、定位失败等任何其它路径都只能改 _docked（当前是否真的吸附）。
         self._auto_dock_enabled = bool(AUTO_DOCK_ENABLED)   # 用户开关，设置窗口可改
         self._docked = False                                # 当前是否真的贴在任务栏上
         self._docking = False                               # 防重入：定位过程会触发移动/DPI 事件
@@ -538,6 +568,10 @@ class VitalPanel(QWidget):
         self._dock_timer.setInterval(DOCK_CHECK_MS)
         self._dock_timer.timeout.connect(self._on_dock_tick)
         # 注意：不在这里 start —— 启动流程是"构造即挂件 → showEvent 完成首次吸附后再启动"
+
+        # 读取持久化配置（仅在锁上时生效）；必须在窗口 show 之前完成，
+        # 否则会先按默认布局显示一帧，再跳到保存的布局。
+        self._load_config()
 
     # ------------------------------------------------------------------ 刷新
 
@@ -553,6 +587,13 @@ class VitalPanel(QWidget):
                 self.update()
                 return
             self._reader.refresh()
+            if DEBUG_LOG:
+                # 排查"切槽位后弧长不动"时的实时读数：随 DEBUG_LOG 开关，发布版不刷屏
+                disk_d = self._reader.slot_item("disk_d")
+                disk_total = self._reader.slot_item("disk_total")
+                print(f"[refresh] slots={self._slot_keys} "
+                      f"disk_d={getattr(disk_d, 'value', None)} "
+                      f"disk_total={getattr(disk_total, 'value', None)}")
             self.update()
         except Exception:
             traceback.print_exc()
@@ -602,9 +643,9 @@ class VitalPanel(QWidget):
         if not self._native_style_applied:
             self._native_style_applied = True
             self._apply_native_window_style()
-        # 兜底：显示时按当前尺寸重算遮罩，
+        # 兜底：显示时按当前尺寸/吸附状态重算背景与遮罩，
         # 防止隐藏期间改过尺寸或跨屏 DPI 变化后遮罩仍是旧尺寸
-        self._apply_round_mask()
+        self._apply_background_mode()
         if self._layout_mode == "widget":
             # 启动流程：showEvent 完成首次吸附 → 安装前台钩子 → 启动吸附定时器
             if AUTO_DOCK_ENABLED and self._auto_dock_enabled and not self._docked:
@@ -631,6 +672,13 @@ class VitalPanel(QWidget):
                 elif (not self._reader.debug_active and not self._timer.isActive()
                       and self.isVisible()):
                     self._timer.start()
+            elif event.type() == QEvent.Type.PaletteChange:
+                # 系统切换深/浅色主题时，挂件需要换配色保证文字可读（大面板配色不变）
+                if self._layout_mode == "widget":
+                    light = self._compute_is_light()
+                    if light != self._widget_light:
+                        self._widget_light = light
+                        self.update()
         except Exception:
             traceback.print_exc()
         super().changeEvent(event)
@@ -656,8 +704,8 @@ class VitalPanel(QWidget):
         """
         super().resizeEvent(event)
         try:
-            # 尺寸一变，圆角遮罩也要跟着重算；否则不透明模式下四角会露出旧尺寸的底色
-            self._apply_round_mask()
+            # 尺寸一变，背景与圆角遮罩都要跟着重算；否则不透明/未吸附态四角会露出旧尺寸底色
+            self._apply_background_mode()
             if not self._fixing_size and self.width() > self._max_width:
                 # 防止任何路径把窗口拉成横跨屏幕的长条；尺寸同样走 _clamp_width()
                 fixed_w = self._clamp_width(self._max_width)
@@ -686,17 +734,25 @@ class VitalPanel(QWidget):
         return QApplication.primaryScreen()
 
     def _keep_on_screen(self) -> None:
-        """把窗口钳制回屏幕可用区域，保证窗口左上角可见、不跑到屏幕外。
+        """把窗口钳制回屏幕范围，保证窗口左上角可见、不跑到屏幕外。
 
-        注意：只在越界时收回，不做居中之类的主动移动。
-        用窗口中心所在的屏幕做钳制目标，避免跨屏时被错误地拉回另一块屏。
-        拖动分支不调用它（拖动过程不钳制），这里只服务于"改变尺寸后可能被顶出屏幕"的场景。
+        注意：
+        - 挂件已吸附时直接返回：吸附位置本来就在任务栏里，而 availableGeometry()
+          不含任务栏区域，用它钳制会把窗口从任务栏里推到任务栏上方（实测 y 1394→1347）。
+        - 挂件未吸附时用 screen.geometry()（完整屏幕，含任务栏区域），
+          否则停在任务栏上的挂件同样会被推走。
+        - 只在大面板模式才用 availableGeometry()。
         """
         try:
             screen = self._screen_for_window()
             if screen is None:
                 return
-            area = screen.availableGeometry()
+            if self._layout_mode == "widget":
+                if self._docked:
+                    return
+                area = screen.geometry()
+            else:
+                area = screen.availableGeometry()
             width = self._clamp_width(self.width())
             x = min(max(self.x(), area.left()), area.right() - width)
             y = min(max(self.y(), area.top()), area.bottom() - self.height())
@@ -846,12 +902,17 @@ class VitalPanel(QWidget):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-            self._draw_background(painter)
-
             if self._layout_mode == "widget":
-                # 挂件模式：只画五个小环（含设置环），没有任何文本行/版本号/齿轮/手柄
+                # 分层窗口的鼠标命中按像素 alpha 判定：alpha=0 的边缘点击会穿透到任务栏。
+                # 无条件铺满整矩形（alpha=1，肉眼不可见），保证最外圈也能接收点击。
+                # 注意：必须放在挂件分支最顶端、任何背景/内容绘制之前，不能放进 _draw_widget()。
+                painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
+                if not self._widget_transparent_flag:
+                    # 未吸附或系统合成关闭：没有任务栏材质可透，必须画深色背景保证文字可读
+                    self._draw_background(painter)
                 self._draw_widget(painter)
             else:
+                self._draw_background(painter)
                 block_bottom = self._block_bottom(self.width())
                 if self._list_mode:
                     self._draw_list(painter)
@@ -905,77 +966,387 @@ class VitalPanel(QWidget):
         painter.drawRoundedRect(rect, 12, 12)
 
     def _draw_widget(self, painter: QPainter) -> None:
-        """挂件模式：按 _slot_keys 画五个小环（设置环不画弧、不画红叉）。"""
-        items = {item.key: item for item in self._reader.items}
+        """挂件模式：按 _slot_keys 画五个槽位（数据环或齿轮，由槽位配置决定）。"""
         for key, (x, y, d) in zip(self._slot_keys, self._widget_ring_positions()):
-            if key == "settings":
-                self._draw_widget_ring(painter, None, x, y, d)
+            if key == "gear":
+                # 齿轮按钮：与数据环共用底环/配色，内部只画小齿轮，不写文字
+                self._draw_gear_icon(painter, x + d / 2.0, y + d / 2.0, d)
             else:
-                self._draw_widget_ring(painter, items.get(key), x, y, d)
+                item = self._reader.slot_item(key)
+                if item is not None:
+                    self._draw_widget_ring(painter, item, x, y, d)
 
-    def _draw_widget_ring(self, painter: QPainter, item, x: float, y: float, d: int) -> None:
-        """画挂件里的单个环：灰底环 + 刻度 + 进度弧/红叉 + 中心名称（7pt）。
+    def _widget_ring_style(self, d: int):
+        """挂件环的统一配色与尺寸：数据环和齿轮必须共用这一份，禁止各写一套。
 
-        注意：
-        - 环内只有名称，没有任何数字；失败项不在环下写原因（挂件空间不够）；
-        - 设置环（item=None）只画底环 + 刻度 + "设置"，永不画红叉、不参与数据刷新。
+        返回：(底环色, 刻度色, 文字色, 环带粗细, 外沿半径, 环中心半径)
         """
-        cx = x + d / 2.0
-        cy = y + d / 2.0
         outer = d / 2.0 - 3.0
         thickness = max(3.0, d * 0.13)
         r_mid = outer - thickness / 2.0
+        if self._widget_light:
+            return (QColor(0, 0, 0, 45), QColor(0, 0, 0, 55),
+                    QColor("#202124"), thickness, outer, r_mid)
+        return (QColor(255, 255, 255, 38), QColor(255, 255, 255, 46),
+                QColor("#E6E9EE"), thickness, outer, r_mid)
 
-        # 1) 灰色底环
-        painter.setPen(QPen(QColor(255, 255, 255, 38), thickness))
+    def _draw_widget_ring(self, painter: QPainter, item, x: float, y: float, d: int) -> None:
+        """画挂件里的单个数据环：灰底环 + 刻度 + 进度弧/红叉 + 中心名称（7pt）。
+
+        注意：
+        - 环内只有名称，没有任何数字；失败项不在环下写原因（挂件空间不够）；
+        - 齿轮位不调用本函数，改由 _draw_gear_icon() 绘制。
+        """
+        cx = x + d / 2.0
+        cy = y + d / 2.0
+        if DEBUG_LOG:
+            # 排查"槽位切了但弧长没动"：打印实际传入绘制的对象（发布版关闭）
+            print(f"[draw] item={item.key} name={item.name} value={item.value}")
+        # 颜色、粗细、半径全部来自共用样式，保证齿轮与数据环完全一致
+        base_ring_color, tick_color, text_color, thickness, outer, r_mid = \
+            self._widget_ring_style(d)
+
+        # 1) 底环
+        painter.setPen(QPen(base_ring_color, thickness))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(QPointF(cx, cy), r_mid, r_mid)
 
         # 2) 低对比度刻度线（只画线，不带任何数字标签）
-        painter.setPen(QPen(QColor(255, 255, 255, 46), 1))
-        step = 360.0 / self.TICKS
-        for i in range(self.TICKS):
-            ang = math.radians(90.0 - i * step)
-            dx, dy = math.cos(ang), -math.sin(ang)
-            painter.drawLine(
-                QPointF(cx + dx * (outer + 0.8), cy + dy * (outer + 0.8)),
-                QPointF(cx + dx * (outer + 2.6), cy + dy * (outer + 2.6)),
-            )
+        # 由设置窗口的「显示环形刻度」开关控制：关掉后只是少一圈短线，
+        # 底环、进度弧/红叉、中心名称仍然照常绘制，环的读数语义不变。
+        if self._show_ticks:
+            painter.setPen(QPen(tick_color, 1))
+            step = 360.0 / self.TICKS
+            for i in range(self.TICKS):
+                ang = math.radians(90.0 - i * step)
+                dx, dy = math.cos(ang), -math.sin(ang)
+                painter.drawLine(
+                    QPointF(cx + dx * (outer + 0.8), cy + dy * (outer + 0.8)),
+                    QPointF(cx + dx * (outer + 2.6), cy + dy * (outer + 2.6)),
+                )
 
-        # 3) 进度弧（数据环正常时）或红叉（数据环失败时）；设置环两者都不画
-        if item is not None:
-            if item.is_ok:
-                painter.setPen(QPen(_value_color(item), thickness,
-                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                rect = QRectF(cx - r_mid, cy - r_mid, 2 * r_mid, 2 * r_mid)
-                span = -int(round((item.value or 0.0) / 100.0 * 360 * 16))
-                if span != 0:
-                    painter.drawArc(rect, 90 * 16, span)
-            else:
-                # 小环内洞要按比例缩小，否则红叉会被裁得看不见
-                self._draw_fail_cross(painter, cx, cy, outer, thickness,
-                                      inner=max(7.0, outer * 0.45))
+        # 3) 进度弧（数据环正常时）或红叉（数据环失败时）
+        if item.is_ok:
+            painter.setPen(QPen(_value_color(item), thickness,
+                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            rect = QRectF(cx - r_mid, cy - r_mid, 2 * r_mid, 2 * r_mid)
+            span = -int(round((item.value or 0.0) / 100.0 * 360 * 16))
+            if span != 0:
+                painter.drawArc(rect, 90 * 16, span)
+        else:
+            # 小环内洞要按比例缩小，否则红叉会被裁得看不见
+            self._draw_fail_cross(painter, cx, cy, outer, thickness,
+                                  inner=max(7.0, outer * 0.45))
 
         # 4) 中心只写名称（7pt），不出现任何数字
-        name = SLOT_LABELS.get("settings" if item is None else item.key, "")
-        painter.setPen(QColor(230, 233, 238))
+        # 名称超宽时自动缩字号（例如动态磁盘/总盘），避免文字糊到环外
+        name = item.name
+        painter.setPen(text_color)
         font = QFont()
         font.setPointSize(7)
+        metrics = QFontMetrics(font)
+        available = max(1, int(d) - 6)
+        while font.pointSize() > 5 and metrics.horizontalAdvance(name) > available:
+            font.setPointSize(font.pointSize() - 1)
+            metrics = QFontMetrics(font)
         painter.setFont(font)
         painter.drawText(QRectF(x, y, d, d), Qt.AlignmentFlag.AlignCenter, name)
 
-    def _apply_round_mask(self) -> None:
+    def _draw_gear_icon(self, painter: QPainter, cx: float, cy: float, d: int) -> None:
+        """画齿轮位：与数据环完全相同的灰色底环 + 缩小到 55% 的实心齿轮。
+
+        做法：齿轮主体圆 + 8 个旋转圆角矩形齿做路径合并，先减去内圈镂空、
+        再减中心孔，最后实心填充。不要用线段拼齿（小尺寸下会变成蜘蛛网）。
+        齿轮是按钮不是数据环，只画图形不写文字，避免和数据环的名称混淆。
+        颜色、粗细、底环全部复用 _widget_ring_style()，不再另写一套。
+        """
+        base_ring_color, _tick_color, text_color, thickness, _outer, r_mid = \
+            self._widget_ring_style(d)
+
+        # 1) 底环：与数据环完全同一套颜色/粗细
+        painter.save()
+        painter.setPen(QPen(base_ring_color, thickness))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), r_mid, r_mid)
+
+        # 2) 齿轮整体缩小到槽位直径的 55%，避免像"黑煤球"一样铺满整格
+        gear_d = d * 0.55
+        r_outer = gear_d * 0.44      # 齿的最外沿
+        r_body = gear_d * 0.32       # 齿轮主体半径
+        r_hole = gear_d * 0.16       # 中心孔半径
+        tooth_w = gear_d * 0.12      # 齿宽（更细，显得轻巧）
+        path = QPainterPath()
+        path.addEllipse(QPointF(cx, cy), r_body, r_body)
+        for i in range(8):
+            tooth = QPainterPath()
+            tooth.addRoundedRect(
+                QRectF(cx - tooth_w / 2.0, cy - r_outer,
+                       tooth_w, r_outer - r_body + 2.0),
+                1.2, 1.2,
+            )
+            transform = QTransform()
+            transform.translate(cx, cy)
+            transform.rotate(i * 45.0)
+            transform.translate(-cx, -cy)
+            path = path.united(transform.map(tooth))
+
+        # 3) 先挖内圈镂空（让齿轮有机械内圈），再挖中心孔
+        inner = QPainterPath()
+        inner.addEllipse(QPointF(cx, cy), r_body * 0.55, r_body * 0.55)
+        path = path.subtracted(inner)
+        hole = QPainterPath()
+        hole.addEllipse(QPointF(cx, cy), r_hole, r_hole)
+        final_path = path.subtracted(hole)
+
+        # 4) 实心填充，不描边；颜色复用环中心文字色（深色主题浅、浅色主题深）
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(text_color)
+        painter.drawPath(final_path)
+        painter.restore()
+
+    @staticmethod
+    def _compute_is_light() -> bool:
+        """用 Qt 调色板判断系统是浅色还是深色主题（不读注册表）。
+
+        注意：QPalette.Window 的 lightness() > 128 视为浅色主题。
+        取不到调色板时按深色处理（与默认深色背景一致，不会出现深底黑字）。
+        """
+        try:
+            palette = QApplication.palette()
+            return palette.color(QPalette.ColorRole.Window).lightness() > 128
+        except Exception:
+            return False
+
+    def widget_background_transparent(self) -> bool:
+        """挂件背景是否为真透明（系统合成开启才成立），供设置窗口提示使用。"""
+        return bool(self._composition_ok)
+
+    def set_show_ticks(self, enabled: bool) -> None:
+        """设置窗口「显示环形刻度」复选框的入口：只改绘制，不重建控件。"""
+        try:
+            enabled = bool(enabled)
+            if enabled == self._show_ticks:
+                return
+            self._show_ticks = enabled
+            self.update()
+            self._persist_if_locked()      # 锁上时立即保存
+        except Exception:
+            traceback.print_exc()
+
+    def show_ticks_enabled(self) -> bool:
+        """供设置窗口读取当前刻度开关状态。"""
+        return bool(self._show_ticks)
+
+    # ------------------------------------------------------------------ 设置持久化（锁）
+
+    def _load_config(self) -> None:
+        """启动时读取 vitalsring_config.json；只有 lock_state=True 时才应用保存值。
+
+        注意：
+        - 文件缺失/损坏/字段非法一律静默回退默认，绝不让程序起不来；
+        - slot_keys 必须严格校验（长度 5、全部在动态池内、互不相同），非法就整组回默认；
+        - 调试模式永远不保存、不读取。
+        """
+        self._lock_state = False
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        # 只有明确为 True 才算锁上，字符串 "true" 之类一律当作未锁
+        self._lock_state = data.get("lock_state") is True
+        if not self._lock_state:
+            return
+        mode = data.get("layout_mode")
+        if mode in ("widget", "panel"):
+            self._layout_mode = mode
+        ticks = data.get("show_ticks")
+        if isinstance(ticks, bool):
+            self._show_ticks = ticks
+        keys = data.get("slot_keys")
+        if self._is_valid_slot_config(keys):
+            self._slot_keys = list(keys)
+        # 大面板布局需要立即套用尺寸；挂件布局交给 showEvent 完成首次吸附
+        if self._layout_mode == "panel":
+            self._apply_layout_mode()
+
+    def _save_config(self) -> bool:
+        """把当前配置写入项目根目录的 JSON；成功返回 True，异常返回 False。
+
+        注意：先写临时文件再替换，避免写一半损坏；写盘失败不抛给调用方，
+        由调用方决定是否提示用户（例如锁按钮写盘失败要弹提示）。
+        """
+        try:
+            payload = {
+                "layout_mode": self._layout_mode,
+                "show_ticks": bool(self._show_ticks),
+                "slot_keys": list(self._slot_keys),
+                "lock_state": bool(self._lock_state),
+            }
+            tmp_path = CONFIG_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, CONFIG_PATH)
+            return True
+        except Exception:
+            traceback.print_exc()
+            # 写盘失败时清掉临时文件，避免项目根目录残留 .tmp
+            try:
+                tmp_path = CONFIG_PATH + ".tmp"
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            return False
+
+    def _persist_if_locked(self) -> None:
+        """锁上时，任何外观/槽位变更立即落盘；解开时只在内存生效。"""
+        if self._lock_state:
+            self._save_config()
+
+    def settings_locked(self) -> bool:
+        """供设置窗口读取锁状态。"""
+        return bool(self._lock_state)
+
+    def set_settings_locked(self, enabled: bool) -> bool:
+        """设置锁开关：上锁和解锁都要写一次 JSON，把 lock_state 记下来。
+
+        返回写盘是否成功；设置窗口在写盘失败时会弹出提示。
+        注意：解锁时必须落盘 lock_state=False，否则重启仍会读到旧的 True 并恢复旧配置，
+        违背"解锁后重启强制恢复默认"的约定。
+        """
+        try:
+            self._lock_state = bool(enabled)
+            return bool(self._save_config())
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def available_slot_items(self):
+        """设置窗口用：动态可选项 [(key, 显示名)]（含动态磁盘与齿轮）。"""
+        return self._reader.available_slot_items()
+
+    def default_slot_keys(self) -> list:
+        """默认五槽位配置（本轮：CPU/GPU/内存/C盘/齿轮）。"""
+        return list(DEFAULT_SLOT_KEYS)
+
+    def _is_valid_slot_config(self, keys) -> bool:
+        """槽位配置校验：长度 5、全部在动态池内、五项互不相同。"""
+        try:
+            if not isinstance(keys, (list, tuple)) or len(keys) != 5:
+                return False
+            if len(set(keys)) != 5:
+                return False
+            pool = set(self._reader.available_slot_keys())
+            return all(isinstance(key, str) and key in pool for key in keys)
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def reposition_settings_window(self) -> None:
+        """设置窗口可见时重新摆放它（模式切换后挂件尺寸变化，避免压住挂件）。"""
+        try:
+            if self._settings is not None and self._settings.isVisible():
+                self._place_settings_window(self._settings)
+        except Exception:
+            traceback.print_exc()
+
+    def reset_appearance(self) -> None:
+        """恢复默认外观：挂件模式、刻度关闭、槽位回默认、吸附开启、检测全开、锁解开。
+
+        注意：默认界面模式是"任务栏挂件模式"（widget），不是大面板。
+        必须先解锁再改其它项——解锁后 _persist_if_locked() 不再写盘；
+        最后再显式写一次 JSON，把 lock_state=False 与恢复后的默认值一起落盘。
+        """
+        try:
+            self.set_settings_locked(False)
+            self.set_layout_mode("widget")
+            self.set_show_ticks(False)
+            self.set_slot_config(list(DEFAULT_SLOT_KEYS))
+            self.set_auto_dock(True)
+            # 检测开关全部恢复开启（动态磁盘项不在 enabled 字典里，默认就是开启）
+            for key in self._reader.enabled:
+                self._reader.enabled[key] = True
+            self._reader.apply_state()
+            self.reposition_settings_window()
+            self._save_config()               # 收尾落盘：lock_state=False + 默认槽位
+        except Exception:
+            traceback.print_exc()
+
+    def _compute_widget_transparent(self) -> bool:
+        """计算挂件是否应全透明：必须同时满足"标记已吸附 + 实际贴着任务栏 + 合成开启"。
+
+        注意：
+        - 只信 _docked 不够——窗口可能被别处代码挪走而标志没更新，
+          此时下方没有任务栏材质可透，透明背景下文字会看不见；
+        - 本函数会调用 Win32 读任务栏矩形，因此**只能在定时器/定位路径**调用，
+          结果缓存在 _widget_transparent_flag 里供 paintEvent 读取（绘制内零 Win32）。
+        """
+        if self._layout_mode != "widget" or not self._composition_ok:
+            return False
+        if not self._docked:
+            return False
+        tb = _taskbar_rect()
+        screen = QApplication.primaryScreen()
+        if tb is None or screen is None:
+            return False
+        dpr = max(1.0, float(screen.devicePixelRatio()))
+        tb_top = tb[1] / dpr
+        tb_bottom = tb[3] / dpr
+        # 窗口纵向必须与任务栏有重叠，才认为它真的贴在任务栏上
+        return (self.y() < tb_bottom) and (self.y() + self.height() > tb_top)
+
+    def _apply_background_mode(self) -> None:
+        """按当前模式/吸附状态套用背景与四角遮罩。
+
+        挂件模式：
+        - 只有"已吸附 + 系统合成开启"才全透明，且不受 FORCE_OPAQUE_BACKGROUND 影响；
+        - 未吸附：合成可用时画 rgba(20,22,26,200) 深色半透明圆角，合成关闭时用 #1E1E1E，
+          两种情况都要加圆角遮罩（否则四角露出系统底色）；
+        - 合成关闭时任何情况都不能透明（会变黑）。
+        大面板模式：沿用原有逻辑（DWM 合成 + FORCE_OPAQUE_BACKGROUND 开关）。
+        """
+        try:
+            transparent = self._compute_widget_transparent()
+            self._widget_transparent_flag = transparent
+            if self._layout_mode == "widget":
+                if transparent:
+                    self._translucent = True
+                    self.clearMask()
+                elif self._composition_ok:
+                    # 未吸附但合成可用：画半透明深色背景（_draw_background 用 alpha 200），
+                    # 同时强制加圆角遮罩——这种"半透明 + 遮罩"的组合只用于挂件未吸附态。
+                    self._translucent = True
+                    self._apply_round_mask(force=True)
+                else:
+                    self._translucent = False
+                    self._apply_round_mask()
+                return
+
+            # 大面板：沿用原有逻辑（DWM 合成 + FORCE_OPAQUE_BACKGROUND 开关）
+            self._translucent = (not FORCE_OPAQUE_BACKGROUND) and self._composition_ok
+            if self._translucent:
+                self.clearMask()
+            else:
+                self._apply_round_mask()
+        except Exception:
+            traceback.print_exc()
+
+    def _apply_round_mask(self, force: bool = False) -> None:
         """半透明不可用时，用窗口遮罩裁出圆角。
 
         注意：不透明窗口没法用 alpha 做圆角，四角会露出系统默认底色（常见就是白角/黑角），
         看起来像"白条"。这里用 QRegion 遮罩把四角裁掉，既保留圆角外观，也不会露出底色。
-        半透明模式不用遮罩——遮罩会让圆弧边缘出现锯齿，交给 alpha 处理更平滑。
+        半透明模式默认不用遮罩——遮罩会让圆弧边缘出现锯齿，交给 alpha 处理更平滑；
+        force=True 用于"挂件未吸附"：虽然画了半透明背景，但按要求仍要裁出圆角。
 
         注意：setMask 同时裁剪鼠标命中，四角 12px 弧区点不到。当前齿轮按钮、缩放手柄斜线、
         版本号都不在该区域（手柄 6 个端点已确认在遮罩内）；以后往窗口角落加控件时必须避开这 12px 弧区。
         """
         try:
-            if self._translucent:
+            if self._translucent and not force:
                 self.clearMask()
                 return
             path = QPainterPath()
@@ -1102,6 +1473,9 @@ class VitalPanel(QWidget):
         try:
             self._layout_mode = mode
             self._apply_layout_mode()
+            self._persist_if_locked()      # 锁上时立即保存界面模式
+            # 模式切换会改变挂件尺寸，设置窗口若正开着需要重新摆放，避免压住挂件
+            self.reposition_settings_window()
         except Exception:
             traceback.print_exc()
         finally:
@@ -1119,7 +1493,7 @@ class VitalPanel(QWidget):
                 self.setMinimumWidth(self._widget_w)
                 self.setMaximumWidth(self._widget_w)
                 self.resize(self._widget_w, self._widget_h)
-                self._apply_round_mask()
+                self._apply_background_mode()
                 if AUTO_DOCK_ENABLED and self._auto_dock_enabled:
                     self._dock_now()
                     if not self._dock_timer.isActive():
@@ -1138,7 +1512,7 @@ class VitalPanel(QWidget):
                 # 大面板宽度回到"上限 - 44"（约 320），避免沿用挂件的 188
                 w = self._clamp_width(self._max_width - 44)
                 self.resize(w, self.heightForWidth(w))
-                self._apply_round_mask()
+                self._apply_background_mode()
                 self._keep_on_screen()
                 self._apply_native_window_style()
             self.update()
@@ -1146,35 +1520,42 @@ class VitalPanel(QWidget):
             traceback.print_exc()
 
     def set_slot_config(self, keys) -> bool:
-        """校验并应用挂件五环配置；校验失败返回 False 且不改变当前配置。
+        """校验并应用挂件五槽位配置；校验失败返回 False 且不改变当前配置。
 
-        规则：长度 5；第 1/3/5 位固定为 cpu/gpu/settings；第 2/4 位必须非空、
-        互不相同、且都属于 SLOT_POOL（mem/disk/battery）。
+        规则（第六轮）：长度 5；每一项都必须在动态池内（含动态磁盘与 gear）；
+        五项互不相同。没有固定位，任何槽位都可以放齿轮或任意数据项。
         """
         try:
-            if not isinstance(keys, (list, tuple)) or len(keys) != 5:
-                return False
-            if keys[0] != "cpu" or keys[2] != "gpu" or keys[4] != "settings":
-                return False
-            slot1, slot3 = keys[1], keys[3]
-            if not slot1 or not slot3 or slot1 == slot3:
-                return False
-            if slot1 not in SLOT_POOL or slot3 not in SLOT_POOL:
+            if not self._is_valid_slot_config(keys):
                 return False
             self._slot_keys = list(keys)
             if self._settings is not None:
                 self._settings.sync_slot_combos()
             self.update()
+            self._persist_if_locked()      # 锁上时立即保存槽位
             return True
         except Exception:
             traceback.print_exc()
             return False
 
-    def _raise_above_taskbar(self) -> None:
-        """把挂件重新置顶到任务栏之上——只作用于本窗口，不改系统设置。"""
+    def _raise_above_taskbar(self, force: bool = False) -> None:
+        """把挂件重新置顶到任务栏之上——只作用于本窗口，不改系统设置。
+
+        注意：带 100ms 去重。一次点击会依次触发 mousePress 的立即提升与
+        120ms / 500ms 两次延迟提升；去重窗口必须小于 120ms，三枪才会都真正执行。
+        同一毫秒内的重复 SetWindowPos 没有意义，还会造成闪烁，因此保留这段去重。
+
+        force=True 供两次延迟提升使用：首次打开设置窗口时 show() 可能阻塞事件循环
+        数百毫秒，导致 120ms 与 500ms 两枪实际只相隔几十毫秒而被去重吞掉；
+        延迟枪本来就是刻意安排的，绕过去重才能保证"三次都生效"。
+        """
         if self._layout_mode != "widget":
             return
         try:
+            now = time.monotonic()
+            if not force and now - self._last_raise_ts < 0.1:
+                return
+            self._last_raise_ts = now
             hwnd = int(self.winId())
             if not hwnd:
                 return
@@ -1234,37 +1615,50 @@ class VitalPanel(QWidget):
             traceback.print_exc()
 
     def _open_detail(self) -> None:
-        """打开详情窗口：优先挂件正上方，上方不够放下方，再不够就钳制进屏幕。"""
+        """打开详情窗口：左边缘与挂件对齐，优先正上方，放不下再改正下方。
+
+        注意：详情窗口若压住挂件，点击会被它截获，"再点一次关闭"就失灵了，
+        因此上下两个位置都按"与挂件留 6px 间隙"计算，最后再钳制进可用区域。
+        """
         try:
             if self._detail is None:
-                self._detail = DetailWindow(self._reader)
+                self._detail = DetailWindow(self._reader, self)
             detail = self._detail
             detail.refresh_content()
-            screen = self.screen() or QApplication.primaryScreen()
-            area = screen.availableGeometry()
-            w, h = detail.width(), detail.height()
-            x = self.x() + (self.width() - w) // 2
-            above = self.y() - h - 6
-            below = self.y() + self.height() + 6
-            if above >= area.top():
-                y = above
-            elif below + h <= area.bottom():
-                y = below
-            else:
-                y = max(area.top(), min(above, area.bottom() - h + 1))
-            x = max(area.left(), min(x, area.right() - w + 1))
-            detail.move(x, y)
+            # 先显示后定位：show() 之前窗口宽高可能还是 0，按 0 尺寸算位置会被摆到
+            # 屏幕右上角之类的对角处。这里先 adjustSize + show，再取真实宽高摆放。
+            detail.adjustSize()
             detail.show()
+            detail.adjustSize()
+            dw, dh = detail.width(), detail.height()
+            wx, wy, ww, wh = self.x(), self.y(), self.width(), self.height()
+            x = wx                      # 左边缘与挂件对齐
+            y = wy - dh - 6             # 优先放在挂件正上方
+            # 副屏适配：用窗口中心所在屏幕，而不是主屏；否则挂件拖到副屏后详情会被摆回主屏
+            screen = self._screen_for_window() or QApplication.primaryScreen()
+            geo = screen.availableGeometry() if screen is not None else QRectF()
+            if y < geo.top():
+                y = wy + wh + 6         # 上方放不下改下方
+            x = min(max(x, geo.left()), geo.right() - dw)
+            y = min(max(y, geo.top()), geo.bottom() - dh)
+            detail.move(x, y)
             detail.raise_()
             detail.activateWindow()
+            self._raise_above_taskbar()     # 详情出现后把挂件重新抬回任务栏之上
         except Exception:
             traceback.print_exc()
+
+    @staticmethod
+    def _rects_overlap(x1, y1, w1, h1, x2, y2, w2, h2) -> bool:
+        """两个矩形是否相交（用于保证详情窗口不盖住挂件）。"""
+        return not (x1 + w1 <= x2 or x2 + w2 <= x1 or y1 + h1 <= y2 or y2 + h2 <= y1)
 
     def _close_detail(self) -> None:
         """关闭详情窗口（挂件被隐藏/切模式/关窗时同步调用）。"""
         try:
             if self._detail is not None and self._detail.isVisible():
                 self._detail.close()
+                self._raise_above_taskbar()   # 详情关闭后保证挂件仍在任务栏之上
         except Exception:
             traceback.print_exc()
 
@@ -1301,33 +1695,34 @@ class VitalPanel(QWidget):
             traceback.print_exc()
 
     def _undock(self, reason: str) -> None:
-        """取消吸附：恢复可拖动/可缩放，并确保窗口可见。"""
+        """取消吸附：恢复可拖动，并把背景从"全透明"退回深色（未吸附时透明会看不清）。"""
         try:
             self._docked = False
             self._dock_rect = None
             self.dock_status_text = reason
+            self._apply_background_mode()
             if not self.isVisible():
                 self.show()
             self.update()
         except Exception:
             traceback.print_exc()
 
-    def _switch_to_manual(self) -> None:
-        """用户一开始拖动，就自动切回手动模式，并把设置窗口的复选框取消勾选。
+    def _undock_for_drag(self) -> None:
+        """拖动挂件时只取消"当前吸附状态"，绝不修改用户的吸附勾选。
 
-        注意：这是需求推荐的交互（比"禁止拖动"更自然），
-        切换后不再自动定位，窗口停在用户放下的位置。
+        注意：_auto_dock_enabled 是用户设置（只有设置窗口/全局开关能改），
+        这里只把 _docked 置 False；松手后 4 秒 tick 会把它自动吸回任务栏。
+        想永久不吸附，请用户去设置窗口取消勾选。
         """
         try:
-            if not self._auto_dock_enabled:
+            if not self._docked:
                 return
-            self._auto_dock_enabled = False
             self._docked = False
             self._dock_rect = None
-            self.dock_status_text = "已切换为手动拖动"
-            self._dock_timer.stop()
-            if self._settings is not None:
-                self._settings.sync_auto_dock(False)
+            self.dock_status_text = "拖动中（松手后会自动吸回）"
+            # 未吸附 → 背景必须从全透明退回深色，否则文字浮在桌面上看不清
+            self._apply_background_mode()
+            self.update()
         except Exception:
             traceback.print_exc()
 
@@ -1384,6 +1779,8 @@ class VitalPanel(QWidget):
             self._docked = True
             self._dock_rect = rect
             self.dock_status_text = "已吸附到任务栏"
+            # 吸附成功后背景要改成"全透明"（吸附前是不透明/半透明兜底）
+            self._apply_background_mode()
             self._raise_above_taskbar()          # 置顶到任务栏之上
             if not self.isVisible():
                 self.show()
@@ -1406,15 +1803,26 @@ class VitalPanel(QWidget):
                 return
             if not (AUTO_DOCK_ENABLED and self._auto_dock_enabled):
                 return
+            # 主题可能随时切换：每次 tick 比一次明暗，变了就重绘（复用现有定时器，不新建）
+            light = self._compute_is_light()
+            if light != self._widget_light:
+                self._widget_light = light
+                self.update()
             rect = _taskbar_rect()
             if rect is None:
                 self._docked = False
                 self.dock_status_text = "未找到任务栏，已回退为手动拖动"
+                # 吸附失败 → 背景不能再透明（否则文字浮在桌面上看不清）
+                self._apply_background_mode()
+                self.update()
                 return
             # 任务栏矩形变了（分辨率/DPI 变化、任务栏换边、Explorer 重建）→ 重新定位
             if not self._docked or rect != self._dock_rect:
                 self._dock_now()
             self._update_dock_visibility()
+            # 每 4 秒校正一次背景：窗口可能被意外挪离任务栏而 _docked 仍是 True，
+            # 位置校验会失败并自动切回不透明背景，避免文字看不见
+            self._apply_background_mode()
             self._raise_above_taskbar()          # 兜底：钩子失效时也保持置顶
         except Exception:
             traceback.print_exc()
@@ -1492,15 +1900,17 @@ class VitalPanel(QWidget):
         painter.drawEllipse(QPointF(cx, cy), r_mid, r_mid)
 
         # 2) 低对比度刻度线：只画短线，绝不允许出现任何数字标签
-        painter.setPen(QPen(QColor(255, 255, 255, 46), 1))
-        step = 360.0 / self.TICKS
-        for i in range(self.TICKS):
-            ang = math.radians(90.0 - i * step)
-            dx, dy = math.cos(ang), -math.sin(ang)              # 屏幕坐标 y 向下，故取负
-            painter.drawLine(
-                QPointF(cx + dx * (outer + 1.5), cy + dy * (outer + 1.5)),
-                QPointF(cx + dx * (outer + 4.5), cy + dy * (outer + 4.5)),
-            )
+        # 与挂件小环共用「显示环形刻度」开关；关掉后底环、进度弧/红叉、名称照常绘制。
+        if self._show_ticks:
+            painter.setPen(QPen(QColor(255, 255, 255, 46), 1))
+            step = 360.0 / self.TICKS
+            for i in range(self.TICKS):
+                ang = math.radians(90.0 - i * step)
+                dx, dy = math.cos(ang), -math.sin(ang)          # 屏幕坐标 y 向下，故取负
+                painter.drawLine(
+                    QPointF(cx + dx * (outer + 1.5), cy + dy * (outer + 1.5)),
+                    QPointF(cx + dx * (outer + 4.5), cy + dy * (outer + 4.5)),
+                )
 
         # 3) 进度弧（从正上方开始、顺时针增长）或失败红叉
         if item.is_ok:
@@ -1671,6 +2081,15 @@ class VitalPanel(QWidget):
                       f"dpr={self.devicePixelRatioF():.2f}")
             if event.button() != Qt.MouseButton.LeftButton:
                 return
+            # 挂件已吸附时，用户一点就先把挂件抬到任务栏之上（按键判断之后立即执行），
+            # 避免详情/设置窗口成为前台后把挂件挤到下面（此时钩子被 SKIPOWNPROCESS 跳过）。
+            # 点击后任务栏/前台窗口可能再次抢占层级，追加两次延迟提升；
+            # 延迟枪用 force=True 绕过去重——打开设置窗口时 show() 可能阻塞事件循环，
+            # 两枪实际间隔会被压到 100ms 内，不绕过就会被去重吞掉一枪。
+            if self._layout_mode == "widget" and self._docked:
+                self._raise_above_taskbar()
+                QTimer.singleShot(120, lambda: self._raise_above_taskbar(force=True))
+                QTimer.singleShot(500, lambda: self._raise_above_taskbar(force=True))
             pos = event.position()
             self._press_pos = pos
             self._moved = False
@@ -1710,10 +2129,6 @@ class VitalPanel(QWidget):
                 else:
                     # 挂件模式没有手柄/齿轮，统一恢复默认光标
                     self.unsetCursor()
-            # 挂件已吸附时不允许拖动（位置由定位逻辑决定）；但仍要能"点击"，
-            # 所以这里直接返回、不把本次移动算作拖动，松开时仍会触发点击动作。
-            if self._layout_mode == "widget" and self._docked:
-                return
             if self._resizing:
                 delta = event.globalPosition().x() - self._resize_start_x
                 new_w = self._clamp_width(int(self._resize_start_w + delta))
@@ -1728,9 +2143,10 @@ class VitalPanel(QWidget):
                 moved = event.position() - self._press_pos
                 if abs(moved.x()) + abs(moved.y()) > self.CLICK_SLOP:
                     self._moved = True        # 位移超过阈值：判定为拖动，本次不再执行点击动作
-                    # 挂件未吸附（定位失败回退）或大面板模式时，拖动即切回手动模式
-                    if AUTO_DOCK_ENABLED and self._auto_dock_enabled:
-                        self._switch_to_manual()
+                    # 这里只"判定为拖动"，先不解除吸附：本帧的位移可能被
+                    # _target_still_visible() 拦下（窗口其实一动没动），
+                    # 那种情况下解除吸附会让背景瞬间变不透明，松手也不再是吸附态。
+                    # 真正移动成功后再解除吸附（见下方 move 之前）。
                     if DEBUG_LOG:
                         print(f"[drag] 开始 pos=({self.x()},{self.y()}) "
                               f"dpr={self.devicePixelRatioF():.2f}")
@@ -1746,6 +2162,10 @@ class VitalPanel(QWidget):
             # 混合 DPI 下这里只判断"是否允许这一帧位移"，不搬窗口、不做坐标换算，
             # 避免再次出现跨屏坐标错乱；判断标准是目标位置仍与某块屏幕有足够交集。
             if self._target_still_visible(target):
+                # 窗口真的开始移动了，才解除当前吸附（不修改用户的吸附勾选）。
+                # 松手后 4 秒 tick 会自动吸回；想永久不吸附请去设置里取消勾选。
+                if self._docked:
+                    self._undock_for_drag()
                 self.move(target)
         except Exception:
             # PyQt6 里事件处理函数抛未捕获异常会直接终止进程，表现就是"窗口闪一下消失"
@@ -1782,9 +2202,8 @@ class VitalPanel(QWidget):
             if self._dragging and not self._moved and self._pending_action is not None:
                 self._apply_action(self._pending_action)
             if self._dragging:
-                # 混合 DPI 下逻辑坐标与物理坐标不一致，坐标救援会把窗口搬到看不见的位置，
-                # 所以这里不做坐标救援；拖动途中已用 _target_still_visible() 逐帧把关，
-                # 保证窗口始终留有足够可见区域。
+                # 拖动结束把窗口收回屏幕内，避免松手后窗口留在屏幕外找不回来
+                self._keep_on_screen()
                 if DEBUG_LOG:
                     screen = self.screen()
                     print(f"[drag] 结束 pos=({self.x()},{self.y()}) "
@@ -1802,7 +2221,7 @@ class VitalPanel(QWidget):
         """判断按下的位置落在哪个可点击区域，返回动作名；不属于任何区域则返回 None。
 
         挂件模式：
-        - 命中设置环（槽 4）→ "settings"，直接打开设置窗口；
+        - 命中齿轮槽（槽位配置为 "gear"）→ "settings"，直接打开/收起设置窗口；
         - 命中其它数据环或环间缝隙 → "detail"，弹详情窗口。
         大面板模式：
         - 齿轮 → "settings"；环/文字列表 → "mode"；两个文本行 → "boot"/"os"。
@@ -1810,7 +2229,7 @@ class VitalPanel(QWidget):
         if self._layout_mode == "widget":
             for idx, (x, y, d) in enumerate(self._widget_ring_positions()):
                 if x <= pos.x() <= x + d:
-                    return "settings" if self._slot_keys[idx] == "settings" else "detail"
+                    return "settings" if self._slot_keys[idx] == "gear" else "detail"
             return "detail"           # 环间缝隙也按"弹详情"处理（需求指定）
 
         width = self.width()
@@ -1860,22 +2279,108 @@ class VitalPanel(QWidget):
         self._keep_on_screen()            # 高度变化后可能顶出屏幕底部，这里收回来
 
     def _open_settings(self) -> None:
-        """打开"设置与调试"窗口（懒创建一次，后续复用同一实例）。
+        """打开/收起"设置与调试"窗口（懒创建一次，后续复用同一实例）。
 
-        注意：复用实例可以避免反复新建窗口导致对象累积；
-        每次显示时设置窗口自己会把调试模式复位为关闭。
+        注意：
+        - 已显示时再点齿轮必须收起，并且用 close() 而不是 hide()，
+          这样才会走 SettingsWindow._reset_on_close() 复位调试模式与调试值；
+        - 设置窗口是非模态的（show()），否则会阻塞主窗口、齿轮也点不到第二次。
         """
         try:
+            if self._settings is not None and self._settings.isVisible():
+                self._settings.close()      # 触发 _reset_on_close 复位调试状态
+                self._raise_above_taskbar()
+                return
+            if self._detail is not None and self._detail.isVisible():
+                self._detail.close()
             if self._settings is None:
                 # 作者与仓库地址统一来自本文件顶部常量，避免在设置窗口里再定义一份
                 self._settings = SettingsWindow(
                     self._reader, self, APP_VERSION,
                     repo_url=APP_REPO_URL, author=APP_AUTHOR,
                     auto_dock_available=bool(AUTO_DOCK_ENABLED),
+                    credits=CREDITS,
                 )
-            self._settings.show()
-            self._settings.raise_()
-            self._settings.activateWindow()
+            sw = self._settings
+            # 顺序很重要：先按屏幕限高（放不下时滚动），show() 让 Qt/Windows 定下最终尺寸，
+            # 再按"显示后的真实尺寸"摆放——实测 show() 会让窗口位置偏移约 31px，
+            # 先在 show 前摆放会被这一步带偏，最终压住挂件甚至超出可用区。
+            sw.prepare_for_show()
+            sw.show()
+            self._place_settings_window(sw)
+            sw.raise_()
+            sw.activateWindow()
+            # 设置窗口出现后可能压住挂件，这里把挂件重新抬回任务栏之上
+            self._raise_above_taskbar()
+        except Exception:
+            traceback.print_exc()
+
+    def _place_settings_window(self, sw) -> None:
+        """把设置窗口摆到挂件附近，保证不与挂件矩形重叠、且完整落在可用区域内。
+
+        顺序：正上方 → 正下方 → 贴右边缘。优先上方/下方是为了让挂件继续可见；
+        三个位置都放不下（低分辨率 + 高窗口）时，依次钳制进屏幕并按重叠面积取最小者，
+        实在避不开才允许轻微重叠——剩余空间物理上放不下整个窗口时无法两全。
+        """
+        try:
+            screen = self.screen() or QApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.availableGeometry()
+            w, h = sw.width(), sw.height()
+            gap = 8
+            fx, fy, fw, fh = self.x(), self.y(), self.width(), self.height()
+            # Qt 顶层窗口的 move() 定位的是"含标题栏的边框"，而 geometry() 报告的是客户区，
+            # 实测纵向相差一个标题栏高度（本机 31px）。下面统一按客户区计算位置，
+            # 最后把这段偏移补回去，否则整窗会往下偏 31px，压住任务栏上的挂件。
+            off_x = sw.geometry().x() - sw.pos().x()
+            off_y = sw.geometry().y() - sw.pos().y()
+            # 挂件贴在屏幕左边缘时，"以挂件为中心"会让 470 宽的设置窗口跑到屏幕外，
+            # 所以先用可用区把 x 钳制回来，再判断这个候选位置合不合用。
+            left_x = max(area.left(), min(fx + (fw - w) // 2, area.right() - w + 1))
+            candidates = [
+                (left_x, fy - h - gap),                       # 正上方
+                (left_x, fy + fh + gap),                      # 正下方
+                (area.right() - w + 1,                       # 贴右边缘
+                 max(area.top() + off_y,
+                     min(fy + (fh - h) // 2, area.bottom() - h + 1))),
+            ]
+            chosen = None
+            for cx, cy in candidates:
+                if (cx >= area.left() and cx + w <= area.right() + 1
+                        and cy - off_y >= area.top() and cy + h <= area.bottom() + 1
+                        and not self._rects_overlap(cx, cy, w, h, fx, fy, fw, fh)):
+                    chosen = (cx, cy)
+                    break
+            if chosen is None:
+                best = None
+                for cx, cy in candidates:
+                    cx = max(area.left(), min(cx, area.right() - w + 1))
+                    cy = max(area.top() + off_y, min(cy, area.bottom() - h + 1))
+                    # 重叠面积 = 相交矩形宽 × 高；0 表示完全不压住挂件
+                    ox = max(0, min(cx + w, fx + fw) - max(cx, fx))
+                    oy = max(0, min(cy + h, fy + fh) - max(cy, fy))
+                    score = ox * oy
+                    if best is None or score < best[0]:
+                        best = (score, cx, cy)
+                    if score == 0:
+                        break
+                chosen = (best[1], best[2])
+            sw.move(chosen[0] - off_x, chosen[1] - off_y)
+        except Exception:
+            traceback.print_exc()
+
+    def restore_after_settings(self) -> None:
+        """设置窗口关闭后恢复挂件的背景模式与层级。
+
+        注意：这里绝不调用 _keep_on_screen()/move()/resize()——反复开关设置
+        不允许改变挂件的位置与尺寸（几何变更只发生在拖动与模式切换）。
+        """
+        try:
+            self._apply_background_mode()
+            self.update()
+            if self._layout_mode == "widget" and self._docked:
+                self._raise_above_taskbar()
         except Exception:
             traceback.print_exc()
 
@@ -1896,17 +2401,18 @@ class VitalPanel(QWidget):
 
 
 class DetailWindow(QWidget):
-    """挂件模式的详情窗口：7 行只读信息（含电池），点击任意位置或 Esc 关闭。
+    """挂件模式的详情窗口：按当前槽位配置动态展示，点击任意位置或 Esc 关闭。
 
     注意：
     - 本窗口不创建任何定时器，内容在每次打开时取一次快照，避免额外占用；
-    - 即使挂件上没显示电池，详情里也固定显示完整五项。
+    - 内容不再写死五项：严格按 panel.slot_keys() 逐个取 reader.slot_item()，
+      齿轮位不是数据项，直接跳过；开机时长/系统版本始终附带。
     """
 
     WIDTH = 200
     HEIGHT = 190
 
-    def __init__(self, reader) -> None:
+    def __init__(self, reader, panel) -> None:
         super().__init__(
             None,
             Qt.WindowType.FramelessWindowHint
@@ -1914,6 +2420,7 @@ class DetailWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint,
         )
         self._reader = reader
+        self._panel = panel
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
@@ -1925,8 +2432,32 @@ class DetailWindow(QWidget):
         """打开前刷新一次（数据由主窗口的定时器已读好，这里只触发重绘）。"""
         self.update()
 
+    def content_lines(self):
+        """按当前槽位生成详情文本，返回 [(文本, 是否失败)]。
+
+        paintEvent 与实际打印都使用这一份，保证"看到的"和"测到的"完全一致。
+        """
+        lines = []
+        try:
+            for key in self._panel.slot_keys():
+                if key == "gear":
+                    continue                   # 齿轮不是数据项
+                item = self._reader.slot_item(key)
+                if item is None:
+                    continue
+                if item.is_ok:
+                    lines.append(
+                        (f"{item.name}：{int(round(item.value or 0.0))}%", False))
+                else:
+                    lines.append((f"{item.name}：{item.reason or '读取失败'}", True))
+        except Exception:
+            traceback.print_exc()
+        lines.append((self._reader.boot_text, False))
+        lines.append((self._reader.os_text, False))
+        return lines
+
     def paintEvent(self, event) -> None:
-        """画圆角深色背景 + 7 行信息 + 右下角版本号。"""
+        """画圆角深色背景 + 动态槽位信息 + 开机时长/系统版本 + 版本号。"""
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -1940,20 +2471,8 @@ class DetailWindow(QWidget):
             painter.setFont(font)
             y = 10.0
             line_h = 21.0
-            for item in self._reader.items:
-                if item.is_ok:
-                    painter.setPen(QColor(200, 205, 212))
-                    text = f"{item.name}：{int(round(item.value or 0.0))}%"
-                else:
-                    painter.setPen(COLOR_RED)
-                    text = f"{item.name}：{item.reason or '读取失败'}"
-                painter.drawText(
-                    QRectF(12, y, self.width() - 24, line_h),
-                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text,
-                )
-                y += line_h
-            painter.setPen(QColor(200, 205, 212))
-            for text in (self._reader.boot_text, self._reader.os_text):
+            for text, is_error in self.content_lines():
+                painter.setPen(COLOR_RED if is_error else QColor(200, 205, 212))
                 painter.drawText(
                     QRectF(12, y, self.width() - 24, line_h),
                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text,

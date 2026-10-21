@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """VitalsRing（环脉）数据读取层。
 
 职责：只读采集 CPU / 内存 / GPU / C 盘 / 电池 / 开机时长 / 系统版本。
@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -193,14 +194,41 @@ class SystemReader:
 
     def __init__(self) -> None:
         self.gpu_reader = GpuReader()
-        # 固定顺序：CPU、内存、GPU、C盘、电池（总需求第七条），顺序不得随意调整
+        # 大面板/详情固定五项：CPU、内存、GPU、C盘、电池（顺序不得随意调整）
+        # 注意：C 盘 key 由旧版 "disk" 改为 "disk_c"，与挂件槽位命名统一。
         self.items = [
             ItemData("cpu", "CPU"),
             ItemData("mem", "内存"),
             ItemData("gpu", "GPU"),
-            ItemData("disk", "C盘"),
+            ItemData("disk_c", "C盘"),
             ItemData("battery", "电池"),
         ]
+        self._items_by_key = {item.key: item for item in self.items}
+
+        # ---- 第六轮：挂件槽位的动态数据池 ----
+        # 磁盘枚举只在构造时做一次并缓存：psutil.disk_partitions() 要枚举卷，
+        # 若放进每 2 秒的 refresh() 会明显抬高 CPU；刷新时只对缓存里的挂载点调 disk_usage()。
+        self._disk_partitions = self._enumerate_fixed_partitions()
+        # disk_total 聚合所有固定磁盘；其余固定盘按盘符单独成项（disk_d / disk_e ...）
+        # 名称用"总盘"而不是"总盘"：挂件小环只有 34px，三字名容易溢出环外
+        self.extra_items = [ItemData("disk_total", "总盘")]
+        seen_keys = {item.key for item in self.extra_items}
+        for key, label, _mount in self._disk_partitions:
+            if key == "disk_c" or key in seen_keys:
+                continue
+            self.extra_items.append(ItemData(key, label))
+            seen_keys.add(key)
+        # 槽位 key -> ItemData（五项固定 + 总盘 + 动态磁盘）；gear 由界面层单独绘制
+        self.slot_items = dict(self._items_by_key)
+        for item in self.extra_items:
+            self.slot_items[item.key] = item
+        # 槽位选项顺序：cpu → gpu → mem → disk_c → disk_total → disk_d… → battery
+        self._slot_order = ["cpu", "gpu", "mem", "disk_c", "disk_total"]
+        for key, _label, _mount in self._disk_partitions:
+            if key != "disk_c" and key not in self._slot_order:
+                self._slot_order.append(key)
+        self._slot_order.append("battery")
+
         # 两个文本行的初始值与读取失败时的文案保持一致
         self.boot_text = "开机时长：读取失败"
         self.os_text = "系统版本：读取失败"
@@ -214,21 +242,91 @@ class SystemReader:
         self.debug_values = {}
         # _real_snapshot: 最近一次真实读取的结果，用于"恢复真实值"和关闭调试时立即还原
         self._real_snapshot = {}
+        # 磁盘读取降频时间戳：磁盘（尤其休眠中的外置硬盘）可能让 disk_usage() 阻塞，
+        # 因此最多 10 秒真正读一次，其余 2 秒刷新沿用上次缓存值，避免卡住 GUI。
+        self._last_disk_read = 0.0
+
+    @staticmethod
+    def _drive_letter(mountpoint: str):
+        """从挂载点取盘符：Windows 的 "D:\\" → "D"；取不到返回 None。"""
+        try:
+            drive, _ = os.path.splitdrive(mountpoint or "")
+            if drive and len(drive) >= 2 and drive[1] == ":":
+                return drive[0].upper()
+        except Exception:
+            pass
+        return None
+
+    def _enumerate_fixed_partitions(self):
+        """枚举固定磁盘并缓存，返回 [(key, 显示名, 挂载点)]。
+
+        过滤规则（总需求第六轮）：
+        - 光驱：opts 含 cdrom → 跳过；
+        - 可移动盘：opts 含 removable → 跳过；
+        - fstype 为空 → 跳过；
+        - C 盘单独用 disk_c 表示，其余按 disk_{盘符小写} 命名（如 disk_d）。
+        本函数只在构造时调用一次，刷新时不会重复枚举，避免抬高 CPU。
+        """
+        result = []
+        seen = set()
+        try:
+            parts = psutil.disk_partitions(all=False)
+        except Exception:
+            parts = []
+        for part in parts:
+            try:
+                opts = (getattr(part, "opts", "") or "").lower()
+                if "cdrom" in opts or "removable" in opts:
+                    continue
+                if not (getattr(part, "fstype", "") or "").strip():
+                    continue
+                letter = self._drive_letter(getattr(part, "mountpoint", ""))
+                if letter is None:
+                    continue
+                key = "disk_c" if letter == "C" else f"disk_{letter.lower()}"
+                if key in seen:
+                    continue
+                label = "C盘" if letter == "C" else f"{letter}盘"
+                result.append((key, label, part.mountpoint))
+                seen.add(key)
+            except Exception:
+                continue
+        # 兜底：psutil 没列出 C 盘时也要保证 C 盘可读，否则 disk_c 会永远没有数据
+        if "disk_c" not in seen:
+            result.insert(0, ("disk_c", "C盘", "C:\\"))
+        return result
+
+    def available_slot_items(self):
+        """设置窗口用：返回全部可选槽位项 [(key, 显示名)]，最后附加齿轮。"""
+        labels = {item.key: item.name for item in self.items}
+        labels.update({item.key: item.name for item in self.extra_items})
+        out = [(key, labels.get(key, key)) for key in self._slot_order]
+        out.append(("gear", "齿轮"))
+        return out
+
+    def available_slot_keys(self):
+        """全部可选槽位 key（含 gear），供 main.py 校验配置。"""
+        return [key for key, _label in self.available_slot_items()]
+
+    def slot_item(self, key: str):
+        """按槽位 key 取数据对象；gear 不是数据项，返回 None。"""
+        return self.slot_items.get(key)
 
     def refresh(self) -> None:
         """刷新全部指标；失败只更新数据对象状态，不抛异常、不重建界面控件。"""
-        self._read_cpu(self.items[0])
-        self._read_memory(self.items[1])
-        self.gpu_reader.refresh(self.items[2])
-        self._read_disk(self.items[3])
-        self._read_battery(self.items[4])
+        self._read_cpu(self._items_by_key["cpu"])
+        self._read_memory(self._items_by_key["mem"])
+        self.gpu_reader.refresh(self._items_by_key["gpu"])
+        self._read_disks()                 # C 盘 + 总盘 + 动态磁盘一次算完
+        self._read_battery(self._items_by_key["battery"])
         self._read_boot_text()
         self._read_os_text()
         # 读取完先存一份真实快照，再叠加"检测关闭/调试值"。
-        # 这样切回真实数据时不必重新读一遍，也能保证"恢复真实值"拿到的是真正的读数。
+        # 注意：快照必须覆盖全部数据项（固定五项 + 动态磁盘 + 总盘），
+        # 否则调试模式无法接管 D盘/总盘，切换后也拿不到真实值。
         self._real_snapshot = {
             item.key: (item.value, item.status, item.reason, item.charging)
-            for item in self.items
+            for item in (list(self.items) + list(self.extra_items))
         }
         self.apply_state()
 
@@ -239,7 +337,10 @@ class SystemReader:
         注意：检测关闭时该项调试值不生效（总需求：检测关闭时调试值不生效），
         因此必须先判 enabled，再判 debug_values。
         """
-        for item in self.items:
+        # 遍历全部数据项：固定五项 + 动态磁盘 + 总盘。
+        # 动态项不在 enabled 字典里（默认 True），但必须同样受调试值接管，
+        # 否则在调试模式里拉 D盘/总盘滑块，挂件弧长不会跟着变。
+        for item in (list(self.items) + list(self.extra_items)):
             if not self.enabled.get(item.key, True):
                 item.value = None
                 item.status = STATUS_DISABLED
@@ -292,12 +393,57 @@ class SystemReader:
         except Exception:
             self._set(item, None, STATUS_FAILED, "读取失败")
 
-    def _read_disk(self, item: ItemData) -> None:
-        """读取 C 盘使用率。只读容量信息，不做任何清理、优化或删除动作。"""
-        try:
-            self._set(item, float(psutil.disk_usage("C:\\").percent), STATUS_OK)
-        except Exception:
-            self._set(item, None, STATUS_FAILED, "读取失败")
+    def _read_disks(self) -> None:
+        """读取所有固定磁盘：C 盘、总盘、动态磁盘一次算完。
+
+        注意：
+        - 挂载点列表来自构造时的缓存，这里只做轻量的 psutil.disk_usage() 调用；
+        - 单个磁盘不可读只影响它自己（显示红叉），不拖累其它磁盘；
+        - 总盘 = 所有固定磁盘 used 之和 / total 之和，只用只读的容量信息。
+        - 降频：距上次真正读取不足 10 秒就直接返回，沿用缓存值；
+          避免休眠中的外置硬盘在 2 秒定时器回调里阻塞 GUI（插拔硬盘后需重启程序）。
+        """
+        now = time.monotonic()
+        if now - self._last_disk_read < 10.0:
+            return
+        self._last_disk_read = now
+        total_bytes = 0.0
+        used_bytes = 0.0
+        any_ok = False
+        seen_c = False
+        for key, _label, mount in self._disk_partitions:
+            item = self.slot_items.get(key)
+            if item is None:
+                continue
+            if key == "disk_c":
+                seen_c = True
+            try:
+                usage = psutil.disk_usage(mount)
+            except Exception:
+                self._set(item, None, STATUS_FAILED, "读取失败")
+                continue
+            self._set(item, float(usage.percent), STATUS_OK)
+            total_bytes += float(usage.total)
+            used_bytes += float(usage.used)
+            any_ok = True
+
+        # 兜底：缓存里没有 C 盘（枚举失败）时单独读一次，保证 disk_c 不会永远空白
+        if not seen_c:
+            try:
+                usage = psutil.disk_usage("C:\\")
+                self._set(self._items_by_key["disk_c"], float(usage.percent), STATUS_OK)
+                total_bytes += float(usage.total)
+                used_bytes += float(usage.used)
+                any_ok = True
+            except Exception:
+                self._set(self._items_by_key["disk_c"], None, STATUS_FAILED, "读取失败")
+
+        total_item = self.slot_items["disk_total"]
+        if any_ok and total_bytes > 0:
+            percent = used_bytes / total_bytes * 100.0
+            self._set(total_item, max(0.0, min(100.0, percent)), STATUS_OK)
+        else:
+            self._set(total_item, None, STATUS_FAILED, "读取失败")
 
     def _read_battery(self, item: ItemData) -> None:
         """读取电池电量。
