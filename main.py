@@ -35,8 +35,8 @@ from readers import ItemData, SystemReader
 from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
-# 第 7 轮终极重构 0.10.07.13
-APP_VERSION = "0.10.07.13"
+# 第 7 轮终极重构 0.10.07.21
+APP_VERSION = "0.10.07.21"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -2979,28 +2979,16 @@ class VitalPanel(QWidget):
             traceback.print_exc()
 
     def _place_settings_window(self, sw) -> None:
-        """0.10.07.13：设置窗口固定贴屏幕右下，底边紧贴任务栏上沿。
-
-        注意：Qt 的 move() 定位的是含标题栏的边框，而 geometry() 是客户区；
-        实测纵向差一个标题栏高度，所以 y 要先减去 off_y，
-        才能保证 sw.geometry().bottom() == area.bottom()。
-        """
+        """0.10.07.21：无边框设置窗口贴屏幕左下角、任务栏上方。"""
         try:
             screen = self.screen() or QApplication.primaryScreen()
             if screen is None:
                 return
             area = screen.availableGeometry()
             w, h = sw.width(), sw.height()
-            off_y = sw.geometry().y() - sw.pos().y()
-            x = max(area.left() + 16, area.right() - w - 16)
-            y = area.bottom() - h + 1 - off_y
-            if y < area.top():
-                y = area.top()
+            x = area.left()
+            y = area.bottom() - h + 1
             sw.move(x, y)
-            if DEBUG_LOG:
-                print(f"[settings] geometry={sw.geometry()} "
-                      f"area.bottom={area.bottom()} "
-                      f"window.bottom={sw.geometry().bottom()}")
         except Exception:
             traceback.print_exc()
 

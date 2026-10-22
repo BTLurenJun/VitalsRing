@@ -24,6 +24,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QButtonGroup,
     QComboBox,
@@ -59,6 +60,10 @@ QDialog { background-color: #0d1117; }
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 #settingsContent { background-color: #0d1117; }
+#settingsTitleBar {
+    background-color: #161b22;
+    border-bottom: 1px solid #21262d;
+}
 #debugRowsCard {
     background-color: #161b22;
     border: 1px solid #21262d;
@@ -103,7 +108,7 @@ QPushButton {
     background-color: #21262d;
     border: 1px solid #30363d;
     border-radius: 8px;
-    padding: 7px 14px;
+    padding: 4px 10px;
     color: #e6edf3;
 }
 QPushButton:hover { background-color: #30363d; border-color: #8b949e; }
@@ -150,6 +155,10 @@ QSpinBox {
     border-radius: 6px;
     padding: 3px 6px;
     color: #e6edf3;
+}
+QSpinBox:hover, QSpinBox:focus {
+    border-color: #58a6ff;
+    background-color: #0d1117;
 }
 QScrollBar:vertical { background: #0d1117; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: #30363d; border-radius: 5px; min-height: 30px; }
@@ -390,6 +399,77 @@ class SmoothSlider(QSlider):
         except Exception:
             traceback.print_exc()
 
+class TitleBar(QWidget):
+    """0.10.07.19 无边框设置窗口的自绘标题栏：深色背景 + 标题 + 关闭按钮 + 拖动。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("settingsTitleBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(32)
+        self._drag_offset = None
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 8, 0)
+        layout.setSpacing(6)
+        self._title = QLabel("设置与调试")
+        self._title.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._title.setStyleSheet(
+            "color: #e6edf3; font-size: 13px; font-weight: 600; background: transparent;")
+        layout.addWidget(self._title, 1)
+        self._close_btn = QToolButton()
+        self._close_btn.setText("×")
+        self._close_btn.setToolTip("关闭")
+        self._close_btn.setFixedSize(32, 26)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.setStyleSheet(
+            "QToolButton { background: transparent; border: none; color: #c9d1d9; font-size: 18px; }"
+            "QToolButton:hover { background-color: #30363d; border-radius: 4px; }"
+            "QToolButton:pressed { background-color: #21262d; }")
+        self._close_btn.clicked.connect(self._on_close)
+        layout.addWidget(self._close_btn)
+
+    def _on_close(self) -> None:
+        try:
+            win = self.window()
+            if win is not None:
+                win.close()
+        except Exception:
+            traceback.print_exc()
+
+    def mousePressEvent(self, event) -> None:
+        try:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._drag_offset = (
+                    event.globalPosition().toPoint() - self.window().pos())
+                event.accept()
+                return
+        except Exception:
+            traceback.print_exc()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        try:
+            if (self._drag_offset is not None
+                    and event.buttons() & Qt.MouseButton.LeftButton):
+                self.window().move(
+                    event.globalPosition().toPoint() - self._drag_offset)
+                event.accept()
+                return
+        except Exception:
+            traceback.print_exc()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        try:
+            self._drag_offset = None
+            event.accept()
+            return
+        except Exception:
+            traceback.print_exc()
+        super().mouseReleaseEvent(event)
+
+
 class SettingsWindow(QDialog):
     """设置与调试窗口。
 
@@ -401,6 +481,8 @@ class SettingsWindow(QDialog):
                  repo_url: str = "", author: str = "",
                  auto_dock_available: bool = True, credits=None) -> None:
         super().__init__(panel)
+        # 0.10.07.19：无边框 + 自绘标题栏，彻底去掉系统标题栏与 DWM 阴影/不可见边框
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self._reader = reader
         self._panel = panel
         self._app_version = app_version
@@ -420,9 +502,12 @@ class SettingsWindow(QDialog):
         # 甚至压住任务栏上的挂件。这里限制最大高度并允许滚动，保证低分辨率也能完整操作。
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._title_bar = TitleBar(self)
+        outer.addWidget(self._title_bar)
         self._scroll = QScrollArea(self)
         self._scroll.setWidgetResizable(True)
-        outer.addWidget(self._scroll)
+        outer.addWidget(self._scroll, 1)
         content = QWidget()
         content.setObjectName("settingsContent")
         self._scroll.setWidget(content)
@@ -524,7 +609,7 @@ class SettingsWindow(QDialog):
         rows_inner = QWidget()
         outer_rows_layout.addWidget(rows_inner)
         rows_layout = QVBoxLayout(rows_inner)
-        rows_layout.setContentsMargins(6, 6, 6, 6)
+        rows_layout.setContentsMargins(6, 6, 6, 12)
         rows_layout.setSpacing(2)
         rows_title = QLabel("🎚️ 各项调试值（0~100）")
         rows_title.setStyleSheet("color: #C9CED6; font-size: 11px;")
@@ -532,7 +617,7 @@ class SettingsWindow(QDialog):
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(2)
+        grid.setVerticalSpacing(0)
         self._sliders = {}
         self._spins = {}
         # 调试项 = 动态数据池里除齿轮外的全部数据项（含 D盘、总盘等新增项）。
@@ -555,7 +640,10 @@ class SettingsWindow(QDialog):
             slider.setFixedHeight(22)
             spin = QSpinBox()
             spin.setRange(0, 100)
-            spin.setFixedWidth(40)
+            # 彻底隐藏原生上下按钮，避免 Windows 深色背景下箭头渲染撕裂
+            spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            # 54px：给数字与内部留白足够空间，避免数字被挤压变形
+            spin.setFixedWidth(54)
             spin.setFixedHeight(22)
             row_layout.addWidget(name_label)
             row_layout.addWidget(slider, 1)
@@ -575,8 +663,8 @@ class SettingsWindow(QDialog):
         self._restore_all_btn = QPushButton("恢复全部真实值")
         self._apply_all_btn.clicked.connect(self._on_apply_all)
         self._restore_all_btn.clicked.connect(self._on_restore_all)
-        self._apply_all_btn.setFixedHeight(26)
-        self._restore_all_btn.setFixedHeight(26)
+        self._apply_all_btn.setFixedHeight(28)
+        self._restore_all_btn.setFixedHeight(28)
         all_btn_row.addWidget(self._apply_all_btn, 1)
         all_btn_row.addWidget(self._restore_all_btn, 1)
         rows_layout.addLayout(all_btn_row)
@@ -602,7 +690,7 @@ class SettingsWindow(QDialog):
         left_col.addWidget(rows_card)
         # 0.10.07.13：调试卡不再用阴影 effect，只用 QSS 的 border + 背景色
 
-        # 0.10.07.13：高度 0→220 / 220→0，250ms OutExpo
+        # 0.10.07.13：高度 0→动态目标 / 动态目标→0，250ms OutExpo
         self._rows_anim = QPropertyAnimation(self._rows_box, b"maximumHeight", self)
         self._rows_anim.setDuration(250)
         self._rows_anim.setEasingCurve(QEasingCurve.Type.OutExpo)
@@ -611,6 +699,9 @@ class SettingsWindow(QDialog):
         self._rows_force_timer.setSingleShot(True)
         self._rows_force_timer.timeout.connect(self._force_rows_animation_end)
         self._rows_expanded = False
+        # 展开终值不再写死 220：内层固定内容高度 + 12px 上下边距，
+        # 调试项变多或不同 DPI 下也不会裁切底部“应用 / 恢复”按钮。
+        self._rows_target_height = rows_inner.sizeHint().height() + 12
 
         # ---- 五项检测开关（默认全开；关闭后主窗口对应环显示红叉 + 检测已关闭）----
         detect_box = QGroupBox("🔍 启用检测")
@@ -706,6 +797,8 @@ class SettingsWindow(QDialog):
         style_row.addWidget(self._icon_style_combo)
         style_row.addStretch(1)
         look_layout.addLayout(style_row)
+        # 调试卡与外观栏之间留 12px 间距，展开后不再贴着调试卡底边
+        left_col.addSpacing(12)
         left_col.addWidget(look_box)
 
         # ---- 任务栏吸附（第二阶段）：状态不持久化，重启恢复默认勾选 ----
@@ -784,11 +877,7 @@ class SettingsWindow(QDialog):
         self._set_debug_widgets_enabled(False)
         self._sync_lock_button()
 
-        # 第 7 轮定稿：QSS 不支持 box-shadow，卡片阴影统一用 QGraphicsDropShadowEffect
-        for box in self.findChildren(QGroupBox):
-            self._apply_card_shadow(box)
-
-        # 0.10.07.13：所有按钮统一阴影 + 按压回弹
+        # 0.10.07.14：按钮按压视觉交给 QSS 的 :pressed，不再挂阴影 effect
         for button in (self._apply_all_btn, self._restore_all_btn,
                        self._reset_all_btn, self._reset_slots_btn,
                        self._github_btn):
@@ -807,19 +896,8 @@ class SettingsWindow(QDialog):
             traceback.print_exc()
 
     def _install_button_feedback(self, button) -> None:
-        """按钮阴影：按下压缩贴合，松开 120ms OutQuad 回弹。"""
-        try:
-            effect = QGraphicsDropShadowEffect(button)
-            effect.setBlurRadius(20)
-            effect.setOffset(0, 5)
-            effect.setColor(QColor(0, 0, 0, 120))
-            button.setGraphicsEffect(effect)
-            button.pressed.connect(
-                lambda b=button, e=effect: self._on_button_pressed(b, e))
-            button.released.connect(
-                lambda b=button, e=effect: self._on_button_released(b, e))
-        except Exception:
-            traceback.print_exc()
+        """按钮按压视觉交给 QSS 的 :pressed，不再创建任何 drop shadow effect。"""
+        pass
 
     def _on_button_pressed(self, button, effect) -> None:
         try:
@@ -1120,7 +1198,7 @@ class SettingsWindow(QDialog):
                 self._reader.debug_values.clear()
                 self._reader.apply_state()
                 self._panel.resume_refresh()
-            # 0.10.07.13：高度 0↔220 + 内容 opacity 联动
+            # 0.10.07.13：高度 0↔动态目标高度 + 内容 opacity 联动
             self._animate_debug_rows(bool(checked))
         except Exception:
             traceback.print_exc()
@@ -1134,11 +1212,15 @@ class SettingsWindow(QDialog):
             # 350ms 保险：即使鼠标晃动/失焦/截图打断，也强制收敛
             self._rows_force_timer.start(350)
             if expand:
+                # 动态目标高度：内层真实内容高度 + 12px 上下边距，
+                # 避免写死 220 导致不同 DPI / 行数变多时底部按钮被裁切。
+                target_height = self._rows_inner.sizeHint().height() + 12
+                self._rows_target_height = target_height
                 self._rows_effect.setOpacity(0.0)
                 self._rows_box.setVisible(True)
                 self._rows_box.setMaximumHeight(0)
                 self._rows_anim.setStartValue(0)
-                self._rows_anim.setEndValue(220)
+                self._rows_anim.setEndValue(target_height)
                 self._rows_expanded = True
                 self._rows_anim.start()
                 # 高度先动，50ms 后内容淡入
@@ -1174,7 +1256,8 @@ class SettingsWindow(QDialog):
     def _on_rows_anim_finished(self) -> None:
         try:
             if self._rows_expanded:
-                self._rows_box.setMaximumHeight(220)
+                # 使用动态目标高度，保证底部“应用 / 恢复”按钮完整可见
+                self._rows_box.setMaximumHeight(self._rows_target_height)
             else:
                 self._rows_effect.setOpacity(0.0)
                 self._rows_box.setVisible(False)
@@ -1191,7 +1274,8 @@ class SettingsWindow(QDialog):
             self._rows_inner_anim.stop()
             if self._rows_expanded:
                 self._rows_box.setVisible(True)
-                self._rows_box.setMaximumHeight(220)
+                # 350ms 保险同样收敛到动态目标高度，避免写死 220 裁切按钮
+                self._rows_box.setMaximumHeight(self._rows_target_height)
                 self._rows_effect.setOpacity(1.0)
             else:
                 self._rows_box.setVisible(False)
