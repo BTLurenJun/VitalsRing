@@ -35,8 +35,8 @@ from readers import ItemData, SystemReader
 from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
-# 第 7 轮终极重构 0.10.07.21
-APP_VERSION = "0.10.07.21"
+# 第 7 轮终极重构 0.10.07.22
+APP_VERSION = "0.10.07.22"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -483,6 +483,8 @@ class VitalPanel(QWidget):
         self._settings = None             # 设置窗口实例（懒创建、复用，避免每次点击都新建对象）
         # 设置锁：True = 修改后立即写 JSON、重启保留；False = 只留内存、重启回默认
         self._lock_state = False
+        # 0.10.07.22：写盘失败本次运行只提示一次，避免拖动/切换时反复弹窗
+        self._persist_warned = False
         # 窗口尺寸/位置的自保标志
         self._fixing_size = False         # 防重入：避免 resizeEvent 里再 resize 造成无限递归
 
@@ -1835,9 +1837,32 @@ class VitalPanel(QWidget):
             return False
 
     def _persist_if_locked(self) -> None:
-        """锁上时，任何外观/槽位变更立即落盘；解开时只在内存生效。"""
-        if self._lock_state:
-            self._save_config()
+        """锁上时，任何外观/槽位变更立即落盘；解开时只在内存生效。
+
+        0.10.07.22：写盘失败必须让用户可见——stderr 打一条，且本次运行
+        只提示一次；提示用 QTimer 延迟到事件循环，绝不在定时器或拖动回调里
+        同步弹窗阻塞 GUI。
+        """
+        if not self._lock_state:
+            return
+        if self._save_config():
+            return
+        print("[config] 配置保存失败：当前修改仅本次运行有效", file=sys.stderr)
+        if self._persist_warned:
+            return
+        self._persist_warned = True
+        QTimer.singleShot(0, self._show_persist_warning)
+
+    def _show_persist_warning(self) -> None:
+        """延迟弹出的写盘失败提示；整段 try/except，不阻塞调用方。"""
+        try:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "VitalsRing",
+                "配置保存失败，当前修改仅本次运行有效，重启后可能丢失。\n"
+                "请检查项目目录是否可写、磁盘是否已满。")
+        except Exception:
+            traceback.print_exc()
 
     def settings_locked(self) -> bool:
         """供设置窗口读取锁状态。"""
@@ -2202,14 +2227,16 @@ class VitalPanel(QWidget):
         # QMenu / QComboBox 的弹出层是独立的顶层窗口，模态对话框同理。
         # 它们显示期间若执行 SetWindowPos(HWND_TOPMOST)，会把弹出层顶到挂件下面，
         # 表现为右键菜单一闪而过、下拉框一碰就收。这里必须直接放弃本次置顶。
-        if (QApplication.activePopupWidget() is not None
-                or QApplication.activeModalWidget() is not None):
-            if DEBUG_LOG:
-                print("[raise] 检测到弹出菜单/下拉框或模态窗口，跳过本次置顶")
-            return
-        if self._layout_mode != "widget":
-            return
+        # 0.10.07.22：整个函数体都在 try 内，对象销毁后定时器回调抛 RuntimeError
+        # 也只打印堆栈，不让异常把进程带崩。
         try:
+            if (QApplication.activePopupWidget() is not None
+                    or QApplication.activeModalWidget() is not None):
+                if DEBUG_LOG:
+                    print("[raise] 检测到弹出菜单/下拉框或模态窗口，跳过本次置顶")
+                return
+            if self._layout_mode != "widget":
+                return
             now = time.monotonic()
             if not force and now - self._last_raise_ts < 0.1:
                 return

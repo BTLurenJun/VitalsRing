@@ -1145,6 +1145,15 @@ class SettingsWindow(QDialog):
         """
         super().hideEvent(event)
         try:
+            # 0.10.07.22：先取消"恢复默认"的淡出动画，避免窗口隐藏后
+            # finished 回调仍在已隐藏窗口上执行 reset_appearance / 刷新 UI。
+            if self._fade_anim is not None:
+                self._fade_anim.stop()
+                self._fade_anim = None
+            if self._fade_effect is not None:
+                self._scroll.setGraphicsEffect(None)
+                self._fade_effect = None
+            self._reset_all_btn.setEnabled(True)
             self._stop_open_animation()
             self._reset_on_close()
         except Exception:

@@ -329,7 +329,8 @@ class SystemReader:
         self._real_snapshot = {}
         # 磁盘读取降频时间戳：磁盘（尤其休眠中的外置硬盘）可能让 disk_usage() 阻塞，
         # 因此最多 10 秒真正读一次，其余 2 秒刷新沿用上次缓存值，避免卡住 GUI。
-        self._last_disk_read = 0.0
+        # 0.10.07.22：初值用极小负数，保证开机 10 秒内启动也能在首次 refresh 真正读取。
+        self._last_disk_read = -1e9
 
     @staticmethod
     def _drive_letter(mountpoint: str):
@@ -449,17 +450,26 @@ class SystemReader:
         self._read_cpu(self._items_by_key["cpu"])
         self._read_memory(self._items_by_key["mem"])
         self.gpu_reader.refresh(self._items_by_key["gpu"])
-        self._read_disks()                 # C 盘 + 总盘 + 动态磁盘一次算完
+        got_disks = self._read_disks()     # C 盘 + 总盘 + 动态磁盘一次算完
         self._read_battery(self._items_by_key["battery"])
         self._read_boot_text()
         self._read_os_text()
         # 读取完先存一份真实快照，再叠加"检测关闭/调试值"。
         # 注意：快照必须覆盖全部数据项（固定五项 + 动态磁盘 + 总盘），
         # 否则调试模式无法接管 D盘/总盘，切换后也拿不到真实值。
-        self._real_snapshot = {
-            item.key: (item.value, item.status, item.reason, item.charging)
-            for item in (list(self.items) + list(self.extra_items))
-        }
+        # 0.10.07.22：磁盘降频早退时，item 可能已被 apply_state 写成"检测已关闭"；
+        # 此时 disk_* 项沿用旧真实快照，不能拿派生状态覆盖，旧快照没有才用当前值。
+        old_snapshot = self._real_snapshot
+        new_snapshot = {}
+        for item in (list(self.items) + list(self.extra_items)):
+            if not got_disks and item.key.startswith("disk_"):
+                old = old_snapshot.get(item.key)
+                if old is not None:
+                    new_snapshot[item.key] = old
+                    continue
+            new_snapshot[item.key] = (
+                item.value, item.status, item.reason, item.charging)
+        self._real_snapshot = new_snapshot
         self.apply_state()
 
     def apply_state(self) -> None:
@@ -525,7 +535,7 @@ class SystemReader:
         except Exception:
             self._set(item, None, STATUS_FAILED, "读取失败")
 
-    def _read_disks(self) -> None:
+    def _read_disks(self) -> bool:
         """读取所有固定磁盘：C 盘、总盘、动态磁盘一次算完。
 
         注意：
@@ -534,10 +544,12 @@ class SystemReader:
         - 总盘 = 所有固定磁盘 used 之和 / total 之和，只用只读的容量信息。
         - 降频：距上次真正读取不足 10 秒就直接返回，沿用缓存值；
           避免休眠中的外置硬盘在 2 秒定时器回调里阻塞 GUI（插拔硬盘后需重启程序）。
+        - 0.10.07.22：真正读取返回 True，降频早退返回 False，供 refresh() 判断
+          是否允许用当前 item 值刷新 _real_snapshot。
         """
         now = time.monotonic()
         if now - self._last_disk_read < 10.0:
-            return
+            return False
         self._last_disk_read = now
         total_bytes = 0.0
         used_bytes = 0.0
@@ -583,6 +595,7 @@ class SystemReader:
             self._set(total_item, max(0.0, min(100.0, percent)), STATUS_OK)
         else:
             self._set(total_item, None, STATUS_FAILED, "读取失败")
+        return True
 
     def _read_battery(self, item: ItemData) -> None:
         """读取电池电量。
