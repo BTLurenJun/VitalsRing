@@ -42,3 +42,11 @@ verify_*.png
 evidence_*.png
 # 最终报告引用的验收证据图，仅本机保留，不入库。
 
+
+# ===== PyInstaller 打包产物 =====
+dist/
+# 打包输出目录（含 exe 与 _internal，约 200MB+），由 build_exe.bat 重新生成，不入库。
+build/
+# PyInstaller 中间产物（分析缓存、TOC 文件），每次打包自动重建，不入库。
+*.spec
+# 打包描述文件，由 build_exe.bat 每次自动生成，不入库。

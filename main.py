@@ -36,7 +36,7 @@ from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
 # 第 7 轮终极重构 0.10.07.22
-APP_VERSION = "0.10.07.22"
+APP_VERSION = "0.10.07.23"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -48,9 +48,28 @@ CREDITS = [
     ("代码审查", "大白鲨（Shark）"),
 ]
 
-# 第六轮：设置持久化文件（项目根目录；已加入 .gitignore，绝不入库）
+# 第六轮：设置持久化文件（开发时项目根目录；打包后与 exe 同目录；已加入 .gitignore，绝不入库）
 CONFIG_FILENAME = "vitalsring_config.json"
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME)
+
+
+def get_config_dir() -> str:
+    """集中计算配置目录，全项目唯一入口（0.10.07.23 新增）。
+
+    - 打包后（PyInstaller：sys.frozen 为真）：返回 exe 所在目录。
+      绝不能用 __file__ / sys._MEIPASS —— 打包后它们指向解包临时目录，
+      配置会写进"重打包就消失"的地方；装到 Program Files 下还会写不进去。
+    - 开发时（python main.py）：返回 main.py 所在目录，与改动前完全一致，
+      开发体验零变化。
+
+    只做判断，不建目录、不碰磁盘；失败怎么提示交给调用方
+    （沿用 readers.py 的"异常转失败状态"兜底风格）。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_PATH = os.path.join(get_config_dir(), CONFIG_FILENAME)
 
 # 调试日志总开关：发布版保持 False，避免带控制台的 python.exe 每次刷新都刷屏。
 # 排查"窗口闪一下消失"这类问题时，临时改成 True 即可看到拖动/显示/隐藏的轨迹。
