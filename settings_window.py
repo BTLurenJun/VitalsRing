@@ -93,6 +93,7 @@ QLabel#versionChip { color: #8C919B; background: #161b22; border: 1px solid #212
                      border-radius: 9px; padding: 2px 10px; font-size: 11px; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 #settingsContent { background-color: #0d1117; }
+#settingsHeader { background-color: #0d1117; }
 #settingsTitleBar {
     background-color: #161b22;
     border-bottom: 1px solid #21262d;
@@ -208,7 +209,7 @@ QTabBar::tab { background: #e6e9ee; color: #57606a; }
 QTabBar::tab:selected { background: #ffffff; color: #1f2328; }
 QTabBar::tab:hover:!selected { background: #dfe3e9; }
 QGroupBox { background: #ffffff; border: 1px solid #d0d7de; color: #1f2328; }
-QGroupBox::title { color: #57606a; }
+QGroupBox::title { color: #24292f; background-color: transparent; }
 QLabel { color: #1f2328; }
 QPushButton { background: #ffffff; border: 1px solid #d0d7de; color: #1f2328; }
 QPushButton:hover { background: #f3f4f6; }
@@ -218,6 +219,9 @@ QScrollArea > QWidget > QWidget { background: transparent; }
 QScrollArea > QWidget#qt_scrollarea_viewport { background: #f6f8fa; }
 #settingsTitleBar { background-color: #e9edf1; border-bottom: 1px solid #d0d7de; }
 #settingsContent { background-color: #f6f8fa; }
+#settingsHeader { background-color: #f6f8fa; }
+#settingsWindow { background-color: #f6f8fa; }
+QTabBar#settingsTabBar { background-color: #f6f8fa; }
 QToolButton { color: #1f2328; }
 QRadioButton { color: #1f2328; }
 QCheckBox { color: #1f2328; }
@@ -552,10 +556,16 @@ class TitleBar(QWidget):
         try:
             self._theme = "light" if theme == "light" else "dark"
             if self._theme == "light":
+                self.setStyleSheet(
+                    "QWidget#settingsTitleBar { background-color: #f6f8fa;"
+                    " border-bottom: 1px solid #d0d7de; }")
                 self._title.setStyleSheet(
-                    "color: #1f2328; font-size: 13px; font-weight: 600; background: transparent;")
+                    "color: #24292f; font-size: 13px; font-weight: 600; background: transparent;")
                 self._close_btn.set_theme("light")
             else:
+                self.setStyleSheet(
+                    "QWidget#settingsTitleBar { background-color: #161b22;"
+                    " border-bottom: 1px solid #21262d; }")
                 self._title.setStyleSheet(
                     "color: #e6edf3; font-size: 13px; font-weight: 600; background: transparent;")
                 self._close_btn.set_theme("dark")
@@ -631,6 +641,7 @@ class SettingsWindow(QDialog):
         self._panel_style = panel_style if panel_style in ("tabs", "list") else "tabs"
 
         self.setWindowTitle("设置与调试")
+        self.setObjectName("settingsWindow")
         self.setMinimumWidth(640)
         # 第 7 轮定稿：现代深色 QSS（卡片、无边框下拉、圆角按钮、滑动开关）
         self.setStyleSheet(SETTINGS_QSS)
@@ -908,16 +919,17 @@ class SettingsWindow(QDialog):
 
         # ---- 槽位：5 个位置全部可配，挂件与大面板共用，每项互斥、可放齿轮 ----
         self._slot_box = QGroupBox("🧩 环配置（挂件 / 大面板）")
+        self._slot_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         slot_layout = QVBoxLayout(self._slot_box)
         slot_layout.setSpacing(10)
         # 0.10.07.13：5 个下拉框直接横排，作为底部长条（不额外加说明，保持一屏）
         slot_row = QHBoxLayout()
-        slot_row.setSpacing(6)
+        slot_row.setSpacing(4)
         slot_row.addStretch(1)             # 0.10.08.03：整体居中，不再横向铺满
         self._slot_combos = []
         for index in range(5):
             combo = ModernComboBox()
-            combo.setFixedWidth(94)        # 收紧宽度，五个一排更紧凑
+            combo.setFixedWidth(84)        # 收紧宽度，五个一排更紧凑
             combo.setToolTip(f"第 {index + 1} 位：选择该位置显示的数据项")
             combo.currentIndexChanged.connect(self._on_slot_combo_changed)
             slot_row.addWidget(combo)
@@ -928,7 +940,7 @@ class SettingsWindow(QDialog):
             QStyle.StandardPixmap.SP_BrowserReload))
         self._reset_slots_btn.setIconSize(QSize(16, 16))
         self._reset_slots_btn.clicked.connect(self._on_reset_slots)
-        self._reset_slots_btn.setFixedWidth(96)
+        self._reset_slots_btn.setFixedWidth(80)
         slot_row.addWidget(self._reset_slots_btn)
         slot_row.addStretch(1)
         slot_layout.addLayout(slot_row)

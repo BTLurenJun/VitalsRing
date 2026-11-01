@@ -39,7 +39,7 @@ from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
 # 第 7 轮终极重构 0.10.07.22
-APP_VERSION = "0.10.08.03"
+APP_VERSION = "0.10.08.04"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -512,7 +512,7 @@ class VitalPanel(QWidget):
         self._press_docked = False
         # 设置锁：True = 修改后立即写 JSON、重启保留；False = 只留内存、重启回默认
         self._lock_state = False
-        # 0.10.08.03：外观偏好（受锁保护），以及打开设置的重入锁
+        # 0.10.08.04：外观偏好（受锁保护），以及打开设置的重入锁
         self._theme_mode = "dark"
         self._settings_style = "tabs"
         self._is_opening = False
@@ -1753,10 +1753,12 @@ class VitalPanel(QWidget):
             return False
 
     def set_theme_mode(self, mode: str) -> None:
-        """0.10.08.03：由设置窗口切换暗/亮主题，立即生效并（锁定后）写盘。"""
+        """0.10.08.04：由设置窗口切换暗/亮主题，立即生效并（锁定后）写盘。"""
         try:
             self._theme_mode = mode if mode in ("dark", "light") else "dark"
             self._widget_light = self._compute_is_light()
+            # 0.10.08.04：主题切换后连挂件背景一起重算，避免只换设置窗、挂件还是黑的
+            self._apply_background_mode()
             self.update()
             if self._settings is not None:
                 self._settings.set_theme(self._theme_mode)
@@ -1765,7 +1767,7 @@ class VitalPanel(QWidget):
             traceback.print_exc()
 
     def set_settings_style(self, style: str) -> None:
-        """0.10.08.03：设置面板布局（tabs / list），锁定后写盘。"""
+        """0.10.08.04：设置面板布局（tabs / list），锁定后写盘。"""
         try:
             self._settings_style = style if style in ("tabs", "list") else "tabs"
             if self._settings is not None:
@@ -3122,7 +3124,7 @@ class VitalPanel(QWidget):
         - 设置窗口是非模态的（show()），否则会阻塞主窗口、齿轮也点不到第二次。
         """
         try:
-            # 0.10.08.03：重入锁——狂点齿轮（双击/连击）只允许一次打开动作，
+            # 0.10.08.04：重入锁——狂点齿轮（双击/连击）只允许一次打开动作，
             # 绝不会弹出第二个窗口。
             if self._is_opening:
                 return
@@ -3131,7 +3133,7 @@ class VitalPanel(QWidget):
                 if time.monotonic() - self._settings_shown_ts < 0.35:
                     return
                 self._settings.close()      # 触发 _reset_on_close 复位调试状态
-                # 0.10.08.03：关闭后不再强行把挂件顶到最上，避免与设置窗抢层级
+                # 0.10.08.04：关闭后不再强行把挂件顶到最上，避免与设置窗抢层级
                 return
             if self._detail is not None and self._detail.isVisible():
                 self._detail.close()
