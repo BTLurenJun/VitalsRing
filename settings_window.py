@@ -43,8 +43,12 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QListWidget,
     QScrollArea,
+    QStackedWidget,
+    QTabBar,
     QTabWidget,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QStyle,
@@ -71,6 +75,22 @@ QTabBar::tab { background: #161b22; color: #8C919B; padding: 6px 16px;
                margin-right: 4px; border-radius: 6px; }
 QTabBar::tab:selected { background: #21262d; color: #e6edf3; }
 QTabBar::tab:hover:!selected { background: #1c2128; color: #c9d1d9; }
+QScrollBar:vertical { width: 6px; background: transparent; margin: 0; border: none; }
+QScrollBar::handle:vertical { background: #3b4252; border-radius: 3px; min-height: 24px; }
+QScrollBar::handle:vertical:hover { background: #4c566a; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0; width: 0; border: none; background: none;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { height: 0; }
+QTabBar#settingsTabBar { background: transparent; }
+QListWidget#settingsNav { background: #10151c; border: 1px solid #21262d;
+                          border-radius: 8px; padding: 4px; outline: none; }
+QListWidget#settingsNav::item { padding: 8px 10px; border-radius: 6px; color: #8C919B; }
+QListWidget#settingsNav::item:selected { background: #21262d; color: #e6edf3; }
+QListWidget#settingsNav::item:hover:!selected { background: #1c2128; }
+QLabel#versionChip { color: #8C919B; background: #161b22; border: 1px solid #21262d;
+                     border-radius: 9px; padding: 2px 10px; font-size: 11px; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 #settingsContent { background-color: #0d1117; }
 #settingsTitleBar {
@@ -201,6 +221,16 @@ QScrollArea > QWidget#qt_scrollarea_viewport { background: #f6f8fa; }
 QToolButton { color: #1f2328; }
 QRadioButton { color: #1f2328; }
 QCheckBox { color: #1f2328; }
+QListWidget#settingsNav { background: #ffffff; border: 1px solid #d0d7de; }
+QListWidget#settingsNav::item { color: #57606a; }
+QListWidget#settingsNav::item:selected { background: #e6e9ee; color: #1f2328; }
+QListWidget#settingsNav::item:hover:!selected { background: #f3f4f6; }
+QLabel#versionChip { color: #57606a; background: #ffffff;
+                     border: 1px solid #d0d7de; }
+QScrollBar::handle:vertical { background: #c3c9d2; }
+QScrollBar::handle:vertical:hover { background: #aeb6c2; }
+QToolButton:hover { background: #e6e9ee; border-radius: 4px; }
+QComboBox::drop-down { border: none; }
 """
 
 
@@ -268,6 +298,10 @@ class ToggleSwitch(QWidget):
         self._stretch_anim.start()
         self.toggled.emit(checked)
 
+    def set_theme(self, theme: str) -> None:
+        self._light = (theme == "light")
+        self.update()
+
     def toggle(self) -> None:
         self.setChecked(not self._checked)
 
@@ -278,13 +312,15 @@ class ToggleSwitch(QWidget):
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            light = getattr(self, "_light", False)
             if not self.isEnabled():
-                track = QColor("#21262d")
+                track = QColor("#e5e7eb" if light else "#21262d")
             elif self._checked:
                 track = QColor("#3b82f6")
             else:
-                track = QColor("#30363d")
-            painter.setPen(QPen(QColor(255, 255, 255, 28), 1))
+                track = QColor("#cfd6de" if light else "#30363d")
+            painter.setPen(QPen(QColor(0, 0, 0, 18) if light
+                                else QColor(255, 255, 255, 28), 1))
             painter.setBrush(track)
             painter.drawRoundedRect(QRectF(1, 1, 42, 22), 11, 11)
             # iOS 挤压拉伸：_stretch=1 时圆点变宽变扁，0 时回正圆
@@ -295,10 +331,10 @@ class ToggleSwitch(QWidget):
             y = (24.0 - knob_h) / 2.0
             center = QPointF(x + knob_w / 2.0, y + knob_h / 2.0)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(0, 0, 0, 60))
+            painter.setBrush(QColor(0, 0, 0, 36 if light else 60))
             painter.drawEllipse(QPointF(center.x() + 0.6, center.y() + 1.0),
                                 knob_w / 2.0, knob_h / 2.0)
-            painter.setBrush(QColor("#f0f6fc"))
+            painter.setBrush(QColor("#ffffff" if light else "#f0f6fc"))
             painter.drawEllipse(center, knob_w / 2.0, knob_h / 2.0)
         except Exception:
             traceback.print_exc()
@@ -607,18 +643,8 @@ class SettingsWindow(QDialog):
         outer.setSpacing(0)
         self._title_bar = TitleBar(self)
         outer.addWidget(self._title_bar)
-        self._scroll = QScrollArea(self)
-        self._scroll.setWidgetResizable(True)
-        outer.addWidget(self._scroll, 1)
-        content = QWidget()
-        content.setObjectName("settingsContent")
-        self._scroll.setWidget(content)
 
-        root = QVBoxLayout(content)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(10)
-
-        # 建立淡入淡出动画用的对象（懒创建）；重置时对内容区做 200ms + 200ms 过渡
+        # 动画 / 圆角 / 尺寸状态
         self._fade_effect = None
         self._fade_anim = None
         self._open_anim = None
@@ -628,23 +654,22 @@ class SettingsWindow(QDialog):
         self._open_force_timer.setSingleShot(True)
         self._open_force_timer.timeout.connect(self._force_open_animation_end)
         self._button_anims = {}
-        # 0.10.07.25：Win11 系统圆角只申请一次；跨屏防变形用的尺寸锁
         self._rounded_applied = False
-        # 0.10.07.26：圆角看门狗——窗口可见期间每 500ms 校验一次 DWM 圆角偏好，
-        # 被系统重置成默认（0=直角）就立刻补回 2（圆角）。
         self._region_size = None
         self._corner_timer = QTimer(self)
         self._corner_timer.setInterval(500)
         self._corner_timer.timeout.connect(self._ensure_rounded_corners_live)
         self._locked_size = None
         self._resize_guard = False
-        # 0.10.08.01：关闭动画状态与动画对象引用
         self._closing = False
         self._close_anims = None
         self._allow_close = False
 
-        # ---- 设置锁（顶部）：锁上才把配置写进 JSON，重启保留 ----
-        lock_row = QHBoxLayout()
+        # ---- 固定顶部：设置锁 ----
+        header = QWidget()
+        header.setObjectName("settingsHeader")
+        lock_row = QHBoxLayout(header)
+        lock_row.setContentsMargins(14, 10, 14, 4)
         self._lock_btn = QToolButton()
         self._lock_btn.setText("🔓")
         self._lock_btn.setToolTip(
@@ -656,20 +681,41 @@ class SettingsWindow(QDialog):
         lock_hint.setStyleSheet("color: #8C919B;")
         lock_hint.setWordWrap(True)
         lock_row.addWidget(lock_hint, 1)
-        root.addLayout(lock_row)
+        outer.addWidget(header)
 
-        # 0.10.08.01：单页滚动 → 四个分页（QTabWidget）。
-        # 每页独立布局，1080p 下都不需要滚动；QScrollArea 仅作为更小屏幕的安全网保留。
-        self._tabs = QTabWidget()
-        self._tabs.setObjectName("settingsTabs")
-        self._tabs.setDocumentMode(True)
-        root.addWidget(self._tabs, 1)
+        # ---- 主体：左导航（可选） + 右侧（顶部标签 + 内容栈） ----
+        # 阶段1：导航固定，只有内容区滚动；两套导航共用同一个 QStackedWidget。
+        body = QHBoxLayout()
+        body.setContentsMargins(10, 0, 10, 4)
+        body.setSpacing(8)
+
+        self._navlist = QListWidget()
+        self._navlist.setObjectName("settingsNav")
+        self._navlist.setFixedWidth(132)
+        self._navlist.hide()
+        body.addWidget(self._navlist)
+
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        self._tabbar = QTabBar()
+        self._tabbar.setObjectName("settingsTabBar")
+        self._tabbar.setExpanding(False)
+        right.addWidget(self._tabbar)
+
+        self._stack = QStackedWidget()
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setWidget(self._stack)
+        right.addWidget(self._scroll, 1)
+        body.addLayout(right, 1)
+        outer.addLayout(body, 1)
 
         def _make_page():
             page = QWidget()
             page.setObjectName("settingsPage")
             lay = QVBoxLayout(page)
-            lay.setContentsMargins(10, 10, 10, 10)
+            lay.setContentsMargins(10, 8, 10, 8)
             lay.setSpacing(8)
             return page, lay
 
@@ -677,11 +723,15 @@ class SettingsWindow(QDialog):
         perf_page, perf_lay = _make_page()
         debug_page, debug_lay = _make_page()
         about_page, about_lay = _make_page()
-        self._tabs.addTab(general_page, "常规与外观")
-        self._tabs.addTab(perf_page, "性能与检测")
-        self._tabs.addTab(debug_page, "高级调试")
-        self._tabs.addTab(about_page, "关于")
-        self._tabs.currentChanged.connect(lambda _idx: self._resize_to_current_page())
+
+        for name, page in (("常规与外观", general_page), ("性能与检测", perf_page),
+                           ("高级调试", debug_page), ("关于", about_page)):
+            self._stack.addWidget(page)
+            self._tabbar.addTab(name)
+            self._navlist.addItem(name)
+
+        self._tabbar.currentChanged.connect(self._on_nav_changed)
+        self._navlist.currentRowChanged.connect(self._on_nav_changed)
 
         # ---- 界面模式：挂件（默认）/ 大面板，切换立即生效 ----
         mode_box = QGroupBox("🖥️ 界面模式")
@@ -704,6 +754,7 @@ class SettingsWindow(QDialog):
 
         # ---- 系统信息（只读）：挂件模式下这是唯一能看到开机时长/系统版本的地方 ----
         info_box = QGroupBox("📊 系统信息")
+        info_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         info_layout = QVBoxLayout(info_box)
         info_layout.setSpacing(8)
         self._boot_info = QLabel("开机时长：读取失败")
@@ -714,6 +765,7 @@ class SettingsWindow(QDialog):
 
         # ---- 调试模式总开关（始终可点击；关闭时子控件全部置灰）----
         debug_box = QGroupBox("🐞 调试")
+        debug_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         debug_row = QHBoxLayout(debug_box)
         debug_row.setSpacing(16)
         self._debug_check = ToggleRow("🐞 调试模式")
@@ -818,6 +870,7 @@ class SettingsWindow(QDialog):
 
         self._rows_box = rows_card
         debug_lay.addWidget(rows_card)
+        debug_lay.addStretch(1)
         # 0.10.07.13：调试卡不再用阴影 effect，只用 QSS 的 border + 背景色
 
         # 0.10.07.13：高度 0→动态目标 / 动态目标→0，250ms OutExpo
@@ -859,11 +912,12 @@ class SettingsWindow(QDialog):
         slot_layout.setSpacing(10)
         # 0.10.07.13：5 个下拉框直接横排，作为底部长条（不额外加说明，保持一屏）
         slot_row = QHBoxLayout()
-        slot_row.setSpacing(8)
+        slot_row.setSpacing(6)
+        slot_row.addStretch(1)             # 0.10.08.03：整体居中，不再横向铺满
         self._slot_combos = []
         for index in range(5):
             combo = ModernComboBox()
-            combo.setMinimumWidth(92)      # 横排时仍保证文本不被挤成 0 宽
+            combo.setFixedWidth(94)        # 收紧宽度，五个一排更紧凑
             combo.setToolTip(f"第 {index + 1} 位：选择该位置显示的数据项")
             combo.currentIndexChanged.connect(self._on_slot_combo_changed)
             slot_row.addWidget(combo)
@@ -874,7 +928,9 @@ class SettingsWindow(QDialog):
             QStyle.StandardPixmap.SP_BrowserReload))
         self._reset_slots_btn.setIconSize(QSize(16, 16))
         self._reset_slots_btn.clicked.connect(self._on_reset_slots)
+        self._reset_slots_btn.setFixedWidth(96)
         slot_row.addWidget(self._reset_slots_btn)
+        slot_row.addStretch(1)
         slot_layout.addLayout(slot_row)
 
         self._slot_hint = QLabel("挂件与大面板共用同一套槽位配置")
@@ -961,6 +1017,7 @@ class SettingsWindow(QDialog):
 
         # ---- 关于（只读）：作者与仓库地址，字号比正文小一号、颜色 #8C919B ----
         about_box = QGroupBox("ℹ️ 关于")
+        about_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         about_layout = QVBoxLayout(about_box)
         # 作者为空时显示"未填写"，避免出现孤零零的"作者：@"
         self._author_label = QLabel(
@@ -985,12 +1042,17 @@ class SettingsWindow(QDialog):
             self._credits_labels.append(credit_label)
         about_layout.setSpacing(2)          # 行距紧凑，避免四行占太多高度
         about_lay.addWidget(about_box)
-        about_lay.addStretch(1)
         about_lay.addWidget(self._github_btn)
+        about_lay.addStretch(1)
 
         # ---- 版本号（与主窗口显示同一四段版本号）----
         self._version_label = QLabel(f"版本 {self._app_version}")
-        root.addWidget(self._version_label)
+        self._version_label.setObjectName("versionChip")
+        footer = QHBoxLayout()
+        footer.setContentsMargins(12, 0, 12, 8)
+        footer.addStretch(1)
+        footer.addWidget(self._version_label)
+        outer.addLayout(footer)
 
         # ---- 恢复默认设置（底部）：淡出 200ms → 重置 → 淡入 200ms ----
         self._reset_all_btn = QPushButton("恢复默认设置")
@@ -1022,6 +1084,10 @@ class SettingsWindow(QDialog):
 
         # 初始状态：调试模式关闭，五项调试子控件全部禁用
         self._debug_check.toggled.connect(self._on_debug_toggled)
+        # 阶段1：调试卡展开/收起 260ms 之后重算窗口高度（收起时窗口跟着变矮）
+        self._debug_check.toggled.connect(
+            lambda _c: QTimer.singleShot(
+                320, lambda: self._scroll.verticalScrollBar().setValue(0)))
         self._set_debug_widgets_enabled(False)
         self._sync_lock_button()
 
@@ -1092,8 +1158,8 @@ class SettingsWindow(QDialog):
             screen = self._panel.screen() or QApplication.primaryScreen()
             if screen is not None:
                 avail = screen.availableGeometry()
-                self.setMaximumHeight(max(400, min(1000, avail.height() - 20)))
-            self.setMinimumHeight(400)
+                self.setMaximumHeight(max(600, min(1000, avail.height() - 20)))
+            self.setMinimumHeight(280)
             self.setMinimumWidth(560)
             self.resize(600, 620)                     # 占位，showEvent 会马上改成真实尺寸
         except Exception:
@@ -1321,73 +1387,99 @@ class SettingsWindow(QDialog):
             self.setStyleSheet(SETTINGS_QSS + (LIGHT_QSS_OVERRIDE if theme == "light" else ""))
             if getattr(self, "_title_bar", None) is not None:
                 self._title_bar.set_theme(theme)
+            for toggle in self.findChildren(ToggleSwitch):
+                toggle.set_theme(theme)
+            if getattr(self, "_version_label", None) is not None:
+                self._version_label.setProperty("light", theme == "light")
+                self._version_label.style().unpolish(self._version_label)
+                self._version_label.style().polish(self._version_label)
             self.update()
         except Exception:
             traceback.print_exc()
 
+    def _measure_window(self):
+        """固定窗口尺寸：按"最高的那一页"一次算好，切页不再变。
+
+        阶段1整改：
+        - 高度 = 所有页面 sizeHint 的最大值（保证关于页/性能页都放得下，不裁切）
+        - 宽度 = 导航宽 + 所有页面 sizeHint 的最大宽度
+        - 结果夹进屏幕可用区；底边贴任务栏
+        """
+        if self._stack.count() == 0:
+            return None
+        screen = self._panel.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return None
+        area = screen.availableGeometry()
+
+        pages = [self._stack.widget(i) for i in range(self._stack.count())]
+        page_h = max((p.sizeHint().height() for p in pages if p is not None), default=200)
+        page_w = max((p.sizeHint().width() for p in pages if p is not None), default=520)
+
+        nav_w = self._navlist.width() + 8 if self._panel_style == "list" else 0
+        need_w = 10 + nav_w + max(520, page_w) + 10
+        width = max(560, min(need_w, min(760, area.width() - 40)))
+
+        nav_h = self._tabbar.sizeHint().height() + 8
+        need_h = self._title_bar.height() + 52 + nav_h + page_h + 34
+        height = max(320, min(need_h, min(1000, area.height() - 20)))
+        return area, width, height
+
+    def _apply_window_geometry(self) -> None:
+        """一次性摆好窗口；能放下就彻底禁用纵向滚动条。"""
+        try:
+            measured = self._measure_window()
+            if measured is None:
+                return
+            area, width, height = measured
+            self._locked_size = QSize(width, height)
+            self.setGeometry(area.left(), area.bottom() - height, width, height)
+            # 内容能放下 → 关掉滚动条；放不下（更小屏幕）才允许滚动
+            self._scroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+                if height < area.height() - 20 else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        except Exception:
+            traceback.print_exc()
+
+    def _on_nav_changed(self, index: int) -> None:
+        """两套导航互相同步，并驱动内容栈与窗口尺寸。"""
+        try:
+            if index < 0:
+                return
+            if self._stack.currentIndex() != index:
+                self._stack.setCurrentIndex(index)
+            if self._tabbar.currentIndex() != index:
+                self._tabbar.blockSignals(True)
+                self._tabbar.setCurrentIndex(index)
+                self._tabbar.blockSignals(False)
+            if self._navlist.currentRow() != index:
+                self._navlist.blockSignals(True)
+                self._navlist.setCurrentRow(index)
+                self._navlist.blockSignals(False)
+            # 阶段1整改：切页不再改窗口尺寸，只回到内容顶部
+            self._scroll.verticalScrollBar().setValue(0)
+        except Exception:
+            traceback.print_exc()
+
     def set_panel_style(self, style: str) -> None:
-        """0.10.08.02：选项卡（顶部） / 左侧选项列表 两种设置面板布局。"""
+        """阶段1：顶部选项卡 / 左侧列表，仅切换导航可见性并重算尺寸。"""
         try:
             style = style if style in ("tabs", "list") else "tabs"
             self._panel_style = style
-            if getattr(self, "_tabs", None) is None:
-                return
-            self._tabs.setTabPosition(
-                QTabWidget.TabPosition.West if style == "list"
-                else QTabWidget.TabPosition.North)
+            show_list = style == "list"
+            self._navlist.setVisible(show_list)
+            self._tabbar.setVisible(not show_list)
+            self._apply_window_geometry()
         except Exception:
             traceback.print_exc()
 
     def _resize_to_current_page(self) -> None:
-        """0.10.08.02：切页时按当前页内容调整窗口高度，避免"高级调试"页大片空白。
-
-        保持底边不动（贴任务栏），只调整高度；上限仍受可用区约束。
-        """
-        try:
-            page = self._tabs.currentWidget()
-            if page is None:
-                return
-            screen = self._panel.screen() or QApplication.primaryScreen()
-            if screen is None:
-                return
-            area = screen.availableGeometry()
-            max_h = max(400, min(1000, area.height() - 20))
-            need = (page.sizeHint().height() + self._tabs.tabBar().sizeHint().height()
-                    + 40 + self._title_bar.height())
-            h = min(max(360, need), max_h)
-            self._locked_size = QSize(self.width(), h)
-            self.setGeometry(area.left(), area.bottom() - h, self.width(), h)
-        except Exception:
-            traceback.print_exc()
+        """切页时按当前页重算尺寸（保持底边贴任务栏）。"""
+        self._apply_window_geometry()
 
     def _fit_and_place(self) -> None:
-        """按当前内容的真实高度定尺寸，并一次性贴到可用区底部。
-
-        0.10.07.27：所有"打开时该多大、该在哪"的计算集中在这里，只调用一次，
-        且在 showEvent 里（窗口已经完成布局、但还没画第一帧），因此用户看不到
-        中间位置，也不会出现"先错位再弹回"。
-        """
-        try:
-            screen = self._panel.screen() or QApplication.primaryScreen()
-            if screen is None:
-                return
-            area = screen.availableGeometry()
-            max_h = max(400, min(1000, area.height() - 20))
-            self.setMaximumHeight(max_h)
-            self.setMinimumHeight(400)
-
-            frame = 2 * self._scroll.frameWidth()
-            content = self._scroll.widget()
-            hint = content.sizeHint() if content is not None else self.sizeHint()
-            want_w = min(600, max(560, hint.width() + frame))
-            want_h = int(hint.height()) + frame + self._title_bar.height()
-            want_h = min(max(400, want_h), max_h)
-
-            self._locked_size = QSize(want_w, want_h)   # 先锁，避免 resizeEvent 拉回旧值
-            self.setGeometry(area.left(), area.bottom() - want_h, want_w, want_h)
-            self._scroll.verticalScrollBar().setValue(0)
-        except Exception:
-            traceback.print_exc()
+        """showEvent 内一次性定尺寸与位置（阶段1：统一走 _measure_window）。"""
+        self._apply_window_geometry()
 
     def resizeEvent(self, event) -> None:
         """0.10.07.25：跨屏/多 DPI 拖动时，防止设置窗口被瞬间挤成细长条。

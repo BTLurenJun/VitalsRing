@@ -4,11 +4,11 @@
 ![python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![qt](https://img.shields.io/badge/Qt-6-41CD52?logo=qt&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![version](https://img.shields.io/badge/version-0.10.08.02-blue)
+![version](https://img.shields.io/badge/version-0.10.08.03-blue)
 
 > 一个 Windows 11 桌面小工具：无边框置顶小窗，用五个自绘环形实时显示电脑状态。
 
-**当前版本：0.10.08.02**（版本号规则：`0.10.轮次.修改次数`）
+**当前版本：0.10.08.03**（版本号规则：`0.10.轮次.修改次数`）
 
 作者：[@BTLurenJun](https://github.com/BTLurenJun) · 仓库：[BTLurenJun/VitalsRing](https://github.com/BTLurenJun/VitalsRing)
 
@@ -142,7 +142,7 @@ build_exe.bat
 2. **实时性**：打开任务管理器对比，弧长随刷新变化（GPU 环走 `pynvml`，不调用 `nvidia-smi`）。
 3. **失败显示**：既无 `pynvml` 又无 `nvidia-smi` 时，GPU 环显示灰空环 + 红叉 + “不支持”。
 4. **槽位**：挂件与大面板共用同一套槽位配置；齿轮位在文字列表中跳过。
-5. **版本号**：窗口右下角显示 `版本 0.10.08.02`，设置窗口「关于」页显示 `0.10.08.02`。
+5. **版本号**：窗口右下角显示 `版本 0.10.08.03`，设置窗口「关于」页显示 `0.10.08.03`。
 6. **窗口行为**：无系统标题栏、始终置顶、不出现在 Alt+Tab、点击不抢焦点。
 7. **占用**：空闲 CPU 约 1% 以内，挂机 10 分钟内存基本持平。
 8. **设置窗口**：四个分页切换流畅；连续开关 10 次位置不漂移、圆角不丢。

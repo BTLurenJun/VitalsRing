@@ -8,7 +8,6 @@ rem  ²úÎï£ºdist\VitalsRing\VitalsRing.exe£¨Õû¸ö VitalsRing Ä¿Â¼Ò»Æð¿½×ß²ÅÄÜÔËÐÐ£
 rem  ËµÃ÷£º
 rem   1. Ö»µ÷ÓÃÏîÄ¿ÄÚ .venv£¬²»ÎÛÈ¾È«¾Ö»·¾³£»
 rem   2. µ¥Ä¿Â¼ + ÎÞ¿ØÖÆÌ¨£¨--windowed£©£ºË«»÷Ö»³ö¹Ò¼þ£¬²»µ¯ºÚ¿ò£»
-rem   3. --collect-submodules PyQt6 ·ÀÖ¹Â©µô Qt Æ½Ì¨²å¼þµ¼ÖÂÆô¶¯¼´±À£»
 rem   4. PyInstaller Ö»ÊÇ´ò°ü¹¤¾ß£¬²»Ð´½ø requirements.txt¡£
 rem  ±¾ÎÄ¼þÒÔ GBK ±àÂë±£´æ£¬²»Ê¹ÓÃ chcp£¬±ÜÃâÃüÁîÐÐ½âÎöÂÒÂë¡£
 rem ============================================================
@@ -44,7 +43,6 @@ if defined UPXOPT (echo   [UPX] ¼ì²âµ½ UPX£¬ÆôÓÃÑ¹Ëõ) else (echo   [UPX] Î´°²×°£
   --strip ^
   --windowed ^
   --name VitalsRing ^
-  --collect-submodules PyQt6 ^
   --exclude-module tkinter ^
   --exclude-module PyQt6.QtNetwork ^
   --exclude-module PyQt6.QtQml ^
@@ -67,6 +65,28 @@ if defined UPXOPT (echo   [UPX] ¼ì²âµ½ UPX£¬ÆôÓÃÑ¹Ëõ) else (echo   [UPX] Î´°²×°£
   --exclude-module PyQt6.QtSensors ^
   --exclude-module PyQt6.QtWebSockets ^
   --exclude-module PyQt6.QtDBus ^
+  --exclude-module PyQt6.QtSvg ^
+  --exclude-module PyQt6.QtSvgWidgets ^
+  --exclude-module PyQt6.QtOpenGL ^
+  --exclude-module PyQt6.QtOpenGLWidgets ^
+  --exclude-module PyQt6.QtXml ^
+  --exclude-module PyQt6.QtPrintSupport ^
+  --exclude-module PyQt6.QtHelp ^
+  --exclude-module PyQt6.QtUiTools ^
+  --exclude-module unittest ^
+  --exclude-module email ^
+  --exclude-module http ^
+  --exclude-module xml ^
+  --exclude-module html ^
+  --exclude-module urllib ^
+  --exclude-module sqlite3 ^
+  --exclude-module asyncio ^
+  --exclude-module multiprocessing ^
+  --exclude-module pydoc ^
+  --exclude-module doctest ^
+  --exclude-module csv ^
+  --exclude-module ssl ^
+  --exclude-module lib2to3 ^
   %UPXOPT% ^
   main.py
 if errorlevel 1 goto failed
