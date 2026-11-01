@@ -222,6 +222,18 @@ QScrollArea > QWidget#qt_scrollarea_viewport { background: #f6f8fa; }
 #settingsHeader { background-color: #f6f8fa; }
 #settingsWindow { background-color: #f6f8fa; }
 QTabBar#settingsTabBar { background-color: #f6f8fa; }
+QTabBar { background-color: #f6f8fa; }
+QTabWidget { background-color: #f6f8fa; }
+QStackedWidget { background-color: #f6f8fa; }
+QScrollArea { background-color: #f6f8fa; border: none; }
+QScrollArea > QWidget > QWidget { background-color: transparent; }
+#debugRowsCard { background-color: #ffffff; border: 1px solid #d0d7de; }
+QSlider::groove:horizontal { background: #d0d7de; height: 4px; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #3b82f6; height: 4px; border-radius: 2px; }
+QSlider::handle:horizontal { background: #ffffff; border: 1px solid #b6bfc9;
+                             width: 14px; margin: -5px 0; border-radius: 7px; }
+QSpinBox { background: #ffffff; border: 1px solid #d0d7de; color: #24292f; }
+QToolButton { background: transparent; border: none; }
 QToolButton { color: #1f2328; }
 QRadioButton { color: #1f2328; }
 QCheckBox { color: #1f2328; }
@@ -899,6 +911,7 @@ class SettingsWindow(QDialog):
 
         # ---- 五项检测开关（默认全开；关闭后主窗口对应环显示红叉 + 检测已关闭）----
         detect_box = QGroupBox("🔍 启用检测")
+        detect_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         detect_grid = QGridLayout(detect_box)
         detect_grid.setHorizontalSpacing(18)
         detect_grid.setVerticalSpacing(8)
