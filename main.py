@@ -39,7 +39,7 @@ from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
 # 第 7 轮终极重构 0.10.07.22
-APP_VERSION = "0.10.08.01"
+APP_VERSION = "0.10.08.02"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -512,6 +512,10 @@ class VitalPanel(QWidget):
         self._press_docked = False
         # 设置锁：True = 修改后立即写 JSON、重启保留；False = 只留内存、重启回默认
         self._lock_state = False
+        # 0.10.08.02：外观偏好（受锁保护），以及打开设置的重入锁
+        self._theme_mode = "dark"
+        self._settings_style = "tabs"
+        self._is_opening = False
         # 0.10.07.22：写盘失败本次运行只提示一次，避免拖动/切换时反复弹窗
         self._persist_warned = False
         # 窗口尺寸/位置的自保标志
@@ -1748,6 +1752,28 @@ class VitalPanel(QWidget):
         except Exception:
             return False
 
+    def set_theme_mode(self, mode: str) -> None:
+        """0.10.08.02：由设置窗口切换暗/亮主题，立即生效并（锁定后）写盘。"""
+        try:
+            self._theme_mode = mode if mode in ("dark", "light") else "dark"
+            self._widget_light = self._compute_is_light()
+            self.update()
+            if self._settings is not None:
+                self._settings.set_theme(self._theme_mode)
+            self._persist_if_locked()
+        except Exception:
+            traceback.print_exc()
+
+    def set_settings_style(self, style: str) -> None:
+        """0.10.08.02：设置面板布局（tabs / list），锁定后写盘。"""
+        try:
+            self._settings_style = style if style in ("tabs", "list") else "tabs"
+            if self._settings is not None:
+                self._settings.set_panel_style(self._settings_style)
+            self._persist_if_locked()
+        except Exception:
+            traceback.print_exc()
+
     def widget_background_transparent(self) -> bool:
         """挂件背景是否为真透明（系统合成开启才成立），供设置窗口提示使用。"""
         return bool(self._composition_ok)
@@ -1841,6 +1867,12 @@ class VitalPanel(QWidget):
             return
         # 只有明确为 True 才算锁上，字符串 "true" 之类一律当作未锁
         self._lock_state = data.get("lock_state") is True
+        theme = data.get("theme")
+        if theme in ("dark", "light"):
+            self._theme_mode = theme
+        style = data.get("settings_style")
+        if style in ("tabs", "list"):
+            self._settings_style = style
         if not self._lock_state:
             return
         mode = data.get("layout_mode")
@@ -1878,6 +1910,8 @@ class VitalPanel(QWidget):
                 "icon_style": self._icon_style,
                 "slot_keys": list(self._slot_keys),
                 "lock_state": bool(self._lock_state),
+                "theme": self._theme_mode,
+                "settings_style": self._settings_style,
             }
             tmp_path = CONFIG_PATH + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -3088,41 +3122,39 @@ class VitalPanel(QWidget):
         - 设置窗口是非模态的（show()），否则会阻塞主窗口、齿轮也点不到第二次。
         """
         try:
+            # 0.10.08.02：重入锁——狂点齿轮（双击/连击）只允许一次打开动作，
+            # 绝不会弹出第二个窗口。
+            if self._is_opening:
+                return
             if self._settings is not None and self._settings.isVisible():
-                # 0.10.07.24：刚打开 350ms 内的重复点击视为"手抖/等不及"，
-                # 不当作收起——否则首次打开稍慢时，第二下点击反而把窗口关掉，
-                # 用户看到的就是"点两次才有反应"。
+                # 刚打开 350ms 内的重复点击视为"手抖/等不及"
                 if time.monotonic() - self._settings_shown_ts < 0.35:
                     return
                 self._settings.close()      # 触发 _reset_on_close 复位调试状态
-                self._raise_above_taskbar()
+                # 0.10.08.02：关闭后不再强行把挂件顶到最上，避免与设置窗抢层级
                 return
             if self._detail is not None and self._detail.isVisible():
                 self._detail.close()
-            sw = self._ensure_settings()
-            # 0.10.07.27：先算尺寸 → 透明显示 → 立即纠正位置（此时 opacity=0，
-            # 用户看不见，不会闪跳）→ 再淡入。show() 会让 Qt/Windows 按自己的
-            # 规则重摆一次窗口（实测偏 ~50px），所以纠正必须发生在 show 之后，
-            # 但必须发生在动画之前，且窗口仍是全透明。
-            sw.prepare_for_show()
-            sw.setWindowOpacity(0.0)
-            if DEBUG_LOG:
-                print(f"[open] show 前 geometry={sw.geometry().getRect()} "
-                      f"size={sw.width()}x{sw.height()} pos=({sw.x()},{sw.y()})")
-            sw.show()
-            # 0.10.07.27：位置由 SettingsWindow.showEvent 里的 _fit_and_place()
-            # 一次性定好，这里不再 show 后挪窗口（那正是闪跳的来源）。
-            if DEBUG_LOG:
-                QTimer.singleShot(1000, lambda: print(
-                    f"[open] show 后 1s geometry={sw.geometry().getRect()} "
-                    f"size={sw.width()}x{sw.height()} pos=({sw.x()},{sw.y()})"))
-            sw.raise_()
-            sw.activateWindow()
-            sw.start_open_animation()
-            # 记录打开时刻：350ms 内的重复点击不再当作"收起"
-            self._settings_shown_ts = time.monotonic()
-            # 设置窗口出现后可能压住挂件，这里把挂件重新抬回任务栏之上
-            self._raise_above_taskbar()
+            self._is_opening = True
+            try:
+                sw = self._ensure_settings()
+                try:
+                    sw.set_theme(self._theme_mode)
+                    sw.set_panel_style(self._settings_style)
+                except Exception:
+                    traceback.print_exc()
+                # 尺寸与最终位置由 showEvent 的 _fit_and_place() 一次定好
+                sw.prepare_for_show()
+                sw.setWindowOpacity(0.0)
+                sw.show()
+                sw.raise_()
+                sw.activateWindow()
+                # 记录打开时刻：350ms 内的重复点击不再当作"收起"
+                self._settings_shown_ts = time.monotonic()
+                sw.start_open_animation()
+            finally:
+                self._is_opening = False
+
         except Exception:
             traceback.print_exc()
 

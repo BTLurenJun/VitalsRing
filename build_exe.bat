@@ -40,7 +40,8 @@ if defined UPXOPT (echo   [UPX] ¼ì²âµ½ UPX£¬ÆôÓÃÑ¹Ëõ) else (echo   [UPX] Î´°²×°£
 ".venv\Scripts\python.exe" -m PyInstaller ^
   --noconfirm ^
   --clean ^
-  --onedir ^
+  --onefile ^
+  --strip ^
   --windowed ^
   --name VitalsRing ^
   --collect-submodules PyQt6 ^

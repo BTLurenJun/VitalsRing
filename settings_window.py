@@ -178,6 +178,31 @@ QScrollBar::handle:vertical { background: #30363d; border-radius: 5px; min-heigh
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
+# 0.10.08.02：白昼主题覆盖层（追加在深色样式之后，后写规则生效）
+LIGHT_QSS_OVERRIDE = """
+QWidget { color: #1f2328; }
+QWidget#settingsContent, QWidget#settingsPage, QScrollArea, QTabWidget::pane {
+    background: #f6f8fa;
+}
+QTabBar::tab { background: #e6e9ee; color: #57606a; }
+QTabBar::tab:selected { background: #ffffff; color: #1f2328; }
+QTabBar::tab:hover:!selected { background: #dfe3e9; }
+QGroupBox { background: #ffffff; border: 1px solid #d0d7de; color: #1f2328; }
+QGroupBox::title { color: #57606a; }
+QLabel { color: #1f2328; }
+QPushButton { background: #ffffff; border: 1px solid #d0d7de; color: #1f2328; }
+QPushButton:hover { background: #f3f4f6; }
+QComboBox { background: #ffffff; border: 1px solid #d0d7de; color: #1f2328; }
+QComboBox QAbstractItemView { background: #ffffff; color: #1f2328; }
+QScrollArea > QWidget > QWidget { background: transparent; }
+QScrollArea > QWidget#qt_scrollarea_viewport { background: #f6f8fa; }
+#settingsTitleBar { background-color: #e9edf1; border-bottom: 1px solid #d0d7de; }
+#settingsContent { background-color: #f6f8fa; }
+QToolButton { color: #1f2328; }
+QRadioButton { color: #1f2328; }
+QCheckBox { color: #1f2328; }
+"""
+
 
 class ToggleSwitch(QWidget):
     """iOS 风格滑动开关：自绘圆角轨道 + 白色圆点 + 160ms 平滑动画。
@@ -435,13 +460,17 @@ class CloseButton(QToolButton):
             "QToolButton:hover { background-color: #30363d; border-radius: 4px; }"
             "QToolButton:pressed { background-color: #21262d; }")
 
+    def set_theme(self, theme: str) -> None:
+        self._theme = "light" if theme == "light" else "dark"
+        self.update()
+
     def paintEvent(self, event) -> None:
         """先让 QSS 画 hover/pressed 背景，再用 QPainter 在正中心画两条斜线。"""
         super().paintEvent(event)
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            pen = QPen(QColor("#c9d1d9"))
+            pen = QPen(QColor("#1f2328" if getattr(self, "_theme", "dark") == "light" else "#c9d1d9"))
             pen.setWidthF(self.PEN_W)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
@@ -469,6 +498,7 @@ class TitleBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 0, 8, 0)
         layout.setSpacing(6)
+        self._theme = "dark"
         self._title = QLabel("设置与调试")
         self._title.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -481,6 +511,21 @@ class TitleBar(QWidget):
         self._close_btn.setToolTip("关闭")
         self._close_btn.clicked.connect(self._on_close)
         layout.addWidget(self._close_btn)
+
+    def set_theme(self, theme: str) -> None:
+        try:
+            self._theme = "light" if theme == "light" else "dark"
+            if self._theme == "light":
+                self._title.setStyleSheet(
+                    "color: #1f2328; font-size: 13px; font-weight: 600; background: transparent;")
+                self._close_btn.set_theme("light")
+            else:
+                self._title.setStyleSheet(
+                    "color: #e6edf3; font-size: 13px; font-weight: 600; background: transparent;")
+                self._close_btn.set_theme("dark")
+            self.update()
+        except Exception:
+            traceback.print_exc()
 
     def _on_close(self) -> None:
         try:
@@ -532,7 +577,8 @@ class SettingsWindow(QDialog):
 
     def __init__(self, reader, panel, app_version: str,
                  repo_url: str = "", author: str = "",
-                 auto_dock_available: bool = True, credits=None) -> None:
+                 auto_dock_available: bool = True, credits=None,
+                 theme: str = "dark", panel_style: str = "tabs") -> None:
         super().__init__(panel)
         # 0.10.07.19：无边框 + 自绘标题栏，彻底去掉系统标题栏与 DWM 阴影/不可见边框
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -544,6 +590,9 @@ class SettingsWindow(QDialog):
         self._auto_dock_available = auto_dock_available
         # 制作人员署名由 main.CREDITS 通过构造函数传入，避免两处维护同一份名单
         self._credits = list(credits or [])
+        # 0.10.08.02：主题（dark/light）与设置面板样式（tabs/list）
+        self._theme = theme if theme in ("dark", "light") else "dark"
+        self._panel_style = panel_style if panel_style in ("tabs", "list") else "tabs"
 
         self.setWindowTitle("设置与调试")
         self.setMinimumWidth(640)
@@ -632,6 +681,7 @@ class SettingsWindow(QDialog):
         self._tabs.addTab(perf_page, "性能与检测")
         self._tabs.addTab(debug_page, "高级调试")
         self._tabs.addTab(about_page, "关于")
+        self._tabs.currentChanged.connect(lambda _idx: self._resize_to_current_page())
 
         # ---- 界面模式：挂件（默认）/ 大面板，切换立即生效 ----
         mode_box = QGroupBox("🖥️ 界面模式")
@@ -949,6 +999,24 @@ class SettingsWindow(QDialog):
             QStyle.StandardPixmap.SP_BrowserReload))
         self._reset_all_btn.setIconSize(QSize(16, 16))
         self._reset_all_btn.clicked.connect(self._on_reset_all)
+        # 0.10.08.02：白昼/黑夜主题 + 设置面板样式
+        theme_row = ToggleRow("☀️ 白昼模式（亮色主题）")
+        theme_row.setChecked(self._theme == "light")
+        theme_row.toggled.connect(self._on_theme_toggled)
+        general_lay.addWidget(theme_row)
+
+        style_row = QHBoxLayout()
+        style_row.setSpacing(8)
+        style_hint = QLabel("🪟 设置面板样式")
+        style_row.addWidget(style_hint)
+        self._style_combo = ModernComboBox()
+        self._style_combo.addItem("选项卡（顶部）", "tabs")
+        self._style_combo.addItem("选项列表（左侧）", "list")
+        self._style_combo.setCurrentIndex(1 if self._panel_style == "list" else 0)
+        self._style_combo.currentIndexChanged.connect(self._on_panel_style_changed)
+        style_row.addWidget(self._style_combo, 1)
+        general_lay.addLayout(style_row)
+
         general_lay.addStretch(1)
         general_lay.addWidget(self._reset_all_btn)
 
@@ -1026,8 +1094,8 @@ class SettingsWindow(QDialog):
                 avail = screen.availableGeometry()
                 self.setMaximumHeight(max(400, min(1000, avail.height() - 20)))
             self.setMinimumHeight(400)
-            self.setMinimumWidth(640)
-            self.resize(700, 700)                     # 占位，showEvent 会马上改成真实尺寸
+            self.setMinimumWidth(560)
+            self.resize(600, 620)                     # 占位，showEvent 会马上改成真实尺寸
         except Exception:
             traceback.print_exc()
 
@@ -1056,11 +1124,8 @@ class SettingsWindow(QDialog):
             self._open_final_geometry = final
             self.setWindowOpacity(0.0)
             # 0.10.08.01：弹出 = 96% 尺寸居中放大 + 淡入（220ms OutCubic）
-            scale = 0.96
-            sw = int(final.width() * scale)
-            sh = int(final.height() * scale)
-            start = QRect(final.center().x() - sw // 2,
-                          final.center().y() - sh // 2, sw, sh)
+            # 0.10.08.02：从屏幕下方 28px 处滑出 + 淡入（不再用缩放）
+            start = QRect(final.x(), final.y() + 28, final.width(), final.height())
             self._closing = False
 
             opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
@@ -1227,6 +1292,74 @@ class SettingsWindow(QDialog):
         except Exception:
             traceback.print_exc()
 
+    def _on_theme_toggled(self, checked: bool) -> None:
+        try:
+            mode = "light" if checked else "dark"
+            self._theme = mode
+            self.set_theme(mode)
+            panel = self._panel
+            if hasattr(panel, "set_theme_mode"):
+                panel.set_theme_mode(mode)
+        except Exception:
+            traceback.print_exc()
+
+    def _on_panel_style_changed(self, index: int) -> None:
+        try:
+            style = self._style_combo.itemData(index) or "tabs"
+            self.set_panel_style(style)
+            panel = self._panel
+            if hasattr(panel, "set_settings_style"):
+                panel.set_settings_style(style)
+        except Exception:
+            traceback.print_exc()
+
+    def set_theme(self, theme: str) -> None:
+        """0.10.08.02：切换设置窗口的暗/亮主题（QSS 覆盖 + 自绘控件配色）。"""
+        try:
+            theme = theme if theme in ("dark", "light") else "dark"
+            self._theme = theme
+            self.setStyleSheet(SETTINGS_QSS + (LIGHT_QSS_OVERRIDE if theme == "light" else ""))
+            if getattr(self, "_title_bar", None) is not None:
+                self._title_bar.set_theme(theme)
+            self.update()
+        except Exception:
+            traceback.print_exc()
+
+    def set_panel_style(self, style: str) -> None:
+        """0.10.08.02：选项卡（顶部） / 左侧选项列表 两种设置面板布局。"""
+        try:
+            style = style if style in ("tabs", "list") else "tabs"
+            self._panel_style = style
+            if getattr(self, "_tabs", None) is None:
+                return
+            self._tabs.setTabPosition(
+                QTabWidget.TabPosition.West if style == "list"
+                else QTabWidget.TabPosition.North)
+        except Exception:
+            traceback.print_exc()
+
+    def _resize_to_current_page(self) -> None:
+        """0.10.08.02：切页时按当前页内容调整窗口高度，避免"高级调试"页大片空白。
+
+        保持底边不动（贴任务栏），只调整高度；上限仍受可用区约束。
+        """
+        try:
+            page = self._tabs.currentWidget()
+            if page is None:
+                return
+            screen = self._panel.screen() or QApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.availableGeometry()
+            max_h = max(400, min(1000, area.height() - 20))
+            need = (page.sizeHint().height() + self._tabs.tabBar().sizeHint().height()
+                    + 40 + self._title_bar.height())
+            h = min(max(360, need), max_h)
+            self._locked_size = QSize(self.width(), h)
+            self.setGeometry(area.left(), area.bottom() - h, self.width(), h)
+        except Exception:
+            traceback.print_exc()
+
     def _fit_and_place(self) -> None:
         """按当前内容的真实高度定尺寸，并一次性贴到可用区底部。
 
@@ -1246,7 +1379,7 @@ class SettingsWindow(QDialog):
             frame = 2 * self._scroll.frameWidth()
             content = self._scroll.widget()
             hint = content.sizeHint() if content is not None else self.sizeHint()
-            want_w = min(700, max(self.minimumWidth(), hint.width() + frame))
+            want_w = min(600, max(560, hint.width() + frame))
             want_h = int(hint.height()) + frame + self._title_bar.height()
             want_h = min(max(400, want_h), max_h)
 
@@ -1465,10 +1598,8 @@ class SettingsWindow(QDialog):
             event.ignore()
             self._closing = True
             final = QRect(self.geometry())
-            sw = int(final.width() * 0.96)
-            sh = int(final.height() * 0.96)
-            end = QRect(final.center().x() - sw // 2,
-                        final.center().y() - sh // 2, sw, sh)
+            # 0.10.08.02：向下滑出 + 淡出（不再往屏幕中间缩）
+            end = QRect(final.x(), final.y() + 28, final.width(), final.height())
 
             fade = QPropertyAnimation(self, b"windowOpacity", self)
             fade.setDuration(160)
