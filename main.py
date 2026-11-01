@@ -23,7 +23,10 @@ import time
 import traceback
 from ctypes import wintypes
 
-from PyQt6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer
+from PyQt6.QtCore import (
+    QAbstractAnimation, QEasingCurve, QEvent, QPoint, QPointF,
+    QPropertyAnimation, QRect, QRectF, Qt, QTimer,
+)
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QCursor, QFont, QFontMetrics,
     QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QRadialGradient,
@@ -36,7 +39,7 @@ from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
 # 第 7 轮终极重构 0.10.07.22
-APP_VERSION = "0.10.07.27"
+APP_VERSION = "0.10.08.01"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -2195,8 +2198,11 @@ class VitalPanel(QWidget):
             return
         self._switching_mode = True
         try:
+            # 0.10.08.01：记录切换前几何，切换后从旧几何平滑过渡到新几何
+            old_rect = QRect(self.geometry())
             self._layout_mode = mode
             self._apply_layout_mode()
+            self._animate_mode_switch(old_rect)
             self._persist_if_locked()      # 锁上时立即保存界面模式
             # 模式切换会改变挂件尺寸，设置窗口若正开着需要重新摆放，避免压住挂件
             self.reposition_settings_window()
@@ -2204,6 +2210,47 @@ class VitalPanel(QWidget):
             traceback.print_exc()
         finally:
             self._switching_mode = False
+
+    def _animate_mode_switch(self, old_rect) -> None:
+        """0.10.08.01：挂件 ↔ 大面板的宽高过渡（220ms OutCubic）。
+
+        布局已按目标模式算好（new_rect），这里先把窗口摆回旧几何，再补间到新几何；
+        补间期间临时放宽宽高限制，结束后恢复目标模式自己的 min/max，
+        避免中途被 resize 约束卡住。
+        """
+        try:
+            new_rect = QRect(self.geometry())
+            if new_rect == old_rect or not self.isVisible():
+                return
+            anim = QPropertyAnimation(self, b"geometry", self)
+            anim.setDuration(220)
+            anim.setStartValue(old_rect)
+            anim.setEndValue(new_rect)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            lo_w = min(old_rect.width(), new_rect.width())
+            hi_w = max(old_rect.width(), new_rect.width())
+            self.setMinimumWidth(lo_w)
+            self.setMaximumWidth(hi_w)
+            self.setGeometry(old_rect)
+            self._mode_anim = anim
+
+            def _done():
+                try:
+                    if self._layout_mode == "widget":
+                        self.setMinimumWidth(self._widget_w)
+                        self.setMaximumWidth(self._widget_w)
+                    else:
+                        self.setMinimumWidth(self.MIN_WIDTH)
+                        self.setMaximumWidth(self._max_width)
+                    self.setGeometry(new_rect)
+                    self.update()
+                except Exception:
+                    traceback.print_exc()
+
+            anim.finished.connect(_done)
+            anim.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+        except Exception:
+            traceback.print_exc()
 
     def _apply_layout_mode(self) -> None:
         """按当前模式套用尺寸、遮罩、吸附与事件钩子。"""

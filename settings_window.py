@@ -44,6 +44,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QTabWidget,
     QSlider,
     QSpinBox,
     QStyle,
@@ -63,6 +64,13 @@ from PyQt6.QtWidgets import (
 SETTINGS_QSS = """
 QDialog { background-color: #0d1117; }
 QScrollArea { background: transparent; border: none; }
+QTabWidget::pane { border: none; background: transparent; }
+QTabBar { background: transparent; }
+QTabWidget::tab-bar { alignment: left; }
+QTabBar::tab { background: #161b22; color: #8C919B; padding: 6px 16px;
+               margin-right: 4px; border-radius: 6px; }
+QTabBar::tab:selected { background: #21262d; color: #e6edf3; }
+QTabBar::tab:hover:!selected { background: #1c2128; color: #c9d1d9; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 #settingsContent { background-color: #0d1117; }
 #settingsTitleBar {
@@ -581,6 +589,10 @@ class SettingsWindow(QDialog):
         self._corner_timer.timeout.connect(self._ensure_rounded_corners_live)
         self._locked_size = None
         self._resize_guard = False
+        # 0.10.08.01：关闭动画状态与动画对象引用
+        self._closing = False
+        self._close_anims = None
+        self._allow_close = False
 
         # ---- 设置锁（顶部）：锁上才把配置写进 JSON，重启保留 ----
         lock_row = QHBoxLayout()
@@ -597,16 +609,29 @@ class SettingsWindow(QDialog):
         lock_row.addWidget(lock_hint, 1)
         root.addLayout(lock_row)
 
-        # 第 7 轮 0.10.07.13：左右双列，默认一屏放下
-        columns = QHBoxLayout()
-        columns.setSpacing(10)
-        left_col = QVBoxLayout()
-        left_col.setSpacing(8)
-        right_col = QVBoxLayout()
-        right_col.setSpacing(8)
-        columns.addLayout(left_col, 1)
-        columns.addLayout(right_col, 1)
-        root.addLayout(columns)
+        # 0.10.08.01：单页滚动 → 四个分页（QTabWidget）。
+        # 每页独立布局，1080p 下都不需要滚动；QScrollArea 仅作为更小屏幕的安全网保留。
+        self._tabs = QTabWidget()
+        self._tabs.setObjectName("settingsTabs")
+        self._tabs.setDocumentMode(True)
+        root.addWidget(self._tabs, 1)
+
+        def _make_page():
+            page = QWidget()
+            page.setObjectName("settingsPage")
+            lay = QVBoxLayout(page)
+            lay.setContentsMargins(10, 10, 10, 10)
+            lay.setSpacing(8)
+            return page, lay
+
+        general_page, general_lay = _make_page()
+        perf_page, perf_lay = _make_page()
+        debug_page, debug_lay = _make_page()
+        about_page, about_lay = _make_page()
+        self._tabs.addTab(general_page, "常规与外观")
+        self._tabs.addTab(perf_page, "性能与检测")
+        self._tabs.addTab(debug_page, "高级调试")
+        self._tabs.addTab(about_page, "关于")
 
         # ---- 界面模式：挂件（默认）/ 大面板，切换立即生效 ----
         mode_box = QGroupBox("🖥️ 界面模式")
@@ -623,7 +648,7 @@ class SettingsWindow(QDialog):
         mode_group.addButton(self._mode_panel)
         mode_row.addWidget(self._mode_widget)
         mode_row.addWidget(self._mode_panel)
-        left_col.addWidget(mode_box)
+        general_lay.addWidget(mode_box)
         self._mode_widget.toggled.connect(self._on_layout_mode_toggled)
         self._mode_panel.toggled.connect(self._on_layout_mode_toggled)
 
@@ -635,7 +660,7 @@ class SettingsWindow(QDialog):
         self._os_info = QLabel("系统版本：读取失败")
         info_layout.addWidget(self._boot_info)
         info_layout.addWidget(self._os_info)
-        right_col.addWidget(info_box)
+        about_lay.addWidget(info_box)
 
         # ---- 调试模式总开关（始终可点击；关闭时子控件全部置灰）----
         debug_box = QGroupBox("🐞 调试")
@@ -647,7 +672,7 @@ class SettingsWindow(QDialog):
         self._hint_label.setStyleSheet("color: #8C919B;")
         debug_row.addWidget(self._debug_check, 1)
         debug_row.addWidget(self._hint_label)
-        left_col.addWidget(debug_box)
+        debug_lay.addWidget(debug_box)
 
         # ---- 各项调试值：紧凑双列，每行 [项目][滑块][数值]，默认隐藏 ----
         # 用普通 QWidget 而不是 QGroupBox：QGroupBox 有 title/padding，
@@ -742,7 +767,7 @@ class SettingsWindow(QDialog):
         self._rows_opacity_timer.timeout.connect(self._start_rows_opacity_in)
 
         self._rows_box = rows_card
-        left_col.addWidget(rows_card)
+        debug_lay.addWidget(rows_card)
         # 0.10.07.13：调试卡不再用阴影 effect，只用 QSS 的 border + 背景色
 
         # 0.10.07.13：高度 0→动态目标 / 动态目标→0，250ms OutExpo
@@ -776,7 +801,7 @@ class SettingsWindow(QDialog):
             self._detect_checks[item.key] = check
         detect_grid.setColumnStretch(0, 1)
         detect_grid.setColumnStretch(1, 1)
-        right_col.addWidget(detect_box)
+        perf_lay.addWidget(detect_box)
 
         # ---- 槽位：5 个位置全部可配，挂件与大面板共用，每项互斥、可放齿轮 ----
         self._slot_box = QGroupBox("🧩 环配置（挂件 / 大面板）")
@@ -811,7 +836,7 @@ class SettingsWindow(QDialog):
         self._widget_bg_hint.setWordWrap(True)
         self._widget_bg_hint.setVisible(False)
         slot_layout.addWidget(self._widget_bg_hint)
-        root.addWidget(self._slot_box)
+        perf_lay.addWidget(self._slot_box)
 
         # ---- 外观：显示环形刻度（两种模式通用，不随模式置灰）----
         # 刻度是环的通用视觉元素，挂件小环与大面板大环共用同一个开关；
@@ -853,8 +878,8 @@ class SettingsWindow(QDialog):
         style_row.addStretch(1)
         look_layout.addLayout(style_row)
         # 调试卡与外观栏之间留 12px 间距，展开后不再贴着调试卡底边
-        left_col.addSpacing(12)
-        left_col.addWidget(look_box)
+        general_lay.addSpacing(12)
+        general_lay.addWidget(look_box)
 
         # ---- 任务栏吸附（第二阶段）：状态不持久化，重启恢复默认勾选 ----
         dock_box = QGroupBox("📌 任务栏吸附")
@@ -872,7 +897,7 @@ class SettingsWindow(QDialog):
         self._auto_dock_mode_hint.setVisible(False)
         dock_layout.addWidget(self._auto_dock_mode_hint)
         # 0.10.07.13：调试行展开后左列过高，任务栏吸附移到右列以保持 ≤750 无滚动
-        right_col.addWidget(dock_box)
+        general_lay.addWidget(dock_box)
         if not self._auto_dock_available:
             # 总开关 AUTO_DOCK_ENABLED = False：完全回到第一阶段行为，复选框禁用
             self._auto_dock_check.setEnabled(False)
@@ -909,9 +934,9 @@ class SettingsWindow(QDialog):
             about_layout.addWidget(credit_label)
             self._credits_labels.append(credit_label)
         about_layout.setSpacing(2)          # 行距紧凑，避免四行占太多高度
-        right_col.addWidget(about_box)
-        right_col.addStretch(1)
-        right_col.addWidget(self._github_btn)
+        about_lay.addWidget(about_box)
+        about_lay.addStretch(1)
+        about_lay.addWidget(self._github_btn)
 
         # ---- 版本号（与主窗口显示同一四段版本号）----
         self._version_label = QLabel(f"版本 {self._app_version}")
@@ -924,8 +949,8 @@ class SettingsWindow(QDialog):
             QStyle.StandardPixmap.SP_BrowserReload))
         self._reset_all_btn.setIconSize(QSize(16, 16))
         self._reset_all_btn.clicked.connect(self._on_reset_all)
-        left_col.addStretch(1)
-        left_col.addWidget(self._reset_all_btn)
+        general_lay.addStretch(1)
+        general_lay.addWidget(self._reset_all_btn)
 
         # 初始状态：调试模式关闭，五项调试子控件全部禁用
         self._debug_check.toggled.connect(self._on_debug_toggled)
@@ -1030,7 +1055,13 @@ class SettingsWindow(QDialog):
             final = QRect(self.geometry())
             self._open_final_geometry = final
             self.setWindowOpacity(0.0)
-            start = QRect(final)
+            # 0.10.08.01：弹出 = 96% 尺寸居中放大 + 淡入（220ms OutCubic）
+            scale = 0.96
+            sw = int(final.width() * scale)
+            sh = int(final.height() * scale)
+            start = QRect(final.center().x() - sw // 2,
+                          final.center().y() - sh // 2, sw, sh)
+            self._closing = False
 
             opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
             opacity_anim.setDuration(250)
@@ -1038,14 +1069,20 @@ class SettingsWindow(QDialog):
             opacity_anim.setEndValue(1.0)
             opacity_anim.setEasingCurve(QEasingCurve.Type.OutExpo)
 
-            # 0.10.07.27：不再创建 geometry 动画。位置已经由主窗口在 show() 后、
-            # 透明期里一次性摆好；任何后续 setGeometry 都会把窗口拉回上一次的
-            # 旧几何，正是"先错位再弹一下"的来源。这里只保留透明度淡入。
+            # 0.10.08.01：位置与最终尺寸仍由 _fit_and_place() 决定；这里的
+            # geometry 动画只做"96% → 100%"的居中出现，终态与最终几何完全一致。
+            geom_anim = QPropertyAnimation(self, b"geometry", self)
+            geom_anim.setDuration(220)
+            geom_anim.setStartValue(start)
+            geom_anim.setEndValue(final)
+            geom_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
             self._open_anim = opacity_anim
-            self._open_geom_anim = None
+            self._open_geom_anim = geom_anim
             opacity_anim.finished.connect(self._finish_open_animation)
             self._open_force_timer.start(400)
             opacity_anim.start()
+            geom_anim.start()
         except Exception:
             traceback.print_exc()
 
@@ -1154,6 +1191,8 @@ class SettingsWindow(QDialog):
             for delay in (0, 350, 700, 1200):
                 QTimer.singleShot(delay, self._apply_win11_rounded_corners)
             self._apply_rounded_region()
+            self._closing = False
+            self._allow_close = False
             if not self._corner_timer.isActive():
                 self._corner_timer.start()
             self._refresh_labels()
@@ -1410,9 +1449,60 @@ class SettingsWindow(QDialog):
             traceback.print_exc()
 
     def closeEvent(self, event) -> None:
-        """点 X 关闭：复位调试状态（hideEvent 也会兜底复位一次，幂等）。"""
-        self._reset_on_close()
-        super().closeEvent(event)
+        """点 X / Esc 关闭：先做 160ms 淡出 + 缩小动画，再真正关闭。
+
+        0.10.08.01：动画期间 _closing=True 防重入；动画结束清标志并再次 close()，
+        这一次直接放行。异常或窗口不可见时立即关闭，保证永远关得掉。
+        """
+        # 动画结束后会以 _allow_close=True 再进来一次，这一次直接放行
+        if self._allow_close or not self.isVisible():
+            self._allow_close = False
+            self._closing = False
+            self._reset_on_close()
+            super().closeEvent(event)
+            return
+        try:
+            event.ignore()
+            self._closing = True
+            final = QRect(self.geometry())
+            sw = int(final.width() * 0.96)
+            sh = int(final.height() * 0.96)
+            end = QRect(final.center().x() - sw // 2,
+                        final.center().y() - sh // 2, sw, sh)
+
+            fade = QPropertyAnimation(self, b"windowOpacity", self)
+            fade.setDuration(160)
+            fade.setStartValue(self.windowOpacity())
+            fade.setEndValue(0.0)
+            fade.setEasingCurve(QEasingCurve.Type.InCubic)
+
+            shrink = QPropertyAnimation(self, b"geometry", self)
+            shrink.setDuration(160)
+            shrink.setStartValue(final)
+            shrink.setEndValue(end)
+            shrink.setEasingCurve(QEasingCurve.Type.InCubic)
+
+            self._close_anims = (fade, shrink)
+
+            def _done():
+                try:
+                    self._close_anims = None
+                    self.setWindowOpacity(1.0)
+                    # 0.10.08.01：置放行标志再 close()，否则 closeEvent 会再次
+                    # 进入动画分支，形成"永远关不掉"的循环。
+                    self._allow_close = True
+                    self.close()
+                except Exception:
+                    traceback.print_exc()
+
+            fade.finished.connect(_done)
+            fade.start()
+            shrink.start()
+        except Exception:
+            traceback.print_exc()
+            self._closing = False
+            self._reset_on_close()
+            super().closeEvent(event)
 
     def reject(self) -> None:
         """Esc 走 reject()：这里先复位一次，隐藏后 hideEvent 还会再兜底一次。"""

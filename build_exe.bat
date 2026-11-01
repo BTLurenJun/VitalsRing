@@ -33,6 +33,10 @@ if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
 
 echo [3/4] 调用 PyInstaller（单目录 + 无控制台，约 1-3 分钟）...
+set "UPXOPT="
+where upx.exe >nul 2>&1 && for %%U in (upx.exe) do set "UPXOPT=--upx-dir=%%~dp$PATH:U"
+if defined UPXOPT (echo   [UPX] 检测到 UPX，启用压缩) else (echo   [UPX] 未安装，跳过压缩)
+
 ".venv\Scripts\python.exe" -m PyInstaller ^
   --noconfirm ^
   --clean ^
@@ -41,6 +45,28 @@ echo [3/4] 调用 PyInstaller（单目录 + 无控制台，约 1-3 分钟）...
   --name VitalsRing ^
   --collect-submodules PyQt6 ^
   --exclude-module tkinter ^
+  --exclude-module PyQt6.QtNetwork ^
+  --exclude-module PyQt6.QtQml ^
+  --exclude-module PyQt6.QtQuick ^
+  --exclude-module PyQt6.QtQuickWidgets ^
+  --exclude-module PyQt6.QtWebEngineCore ^
+  --exclude-module PyQt6.QtWebEngineWidgets ^
+  --exclude-module PyQt6.QtWebChannel ^
+  --exclude-module PyQt6.QtMultimedia ^
+  --exclude-module PyQt6.QtSql ^
+  --exclude-module PyQt6.QtTest ^
+  --exclude-module PyQt6.QtDesigner ^
+  --exclude-module PyQt6.QtPdf ^
+  --exclude-module PyQt6.QtCharts ^
+  --exclude-module PyQt6.QtDataVisualization ^
+  --exclude-module PyQt6.QtBluetooth ^
+  --exclude-module PyQt6.QtNfc ^
+  --exclude-module PyQt6.QtPositioning ^
+  --exclude-module PyQt6.QtSerialPort ^
+  --exclude-module PyQt6.QtSensors ^
+  --exclude-module PyQt6.QtWebSockets ^
+  --exclude-module PyQt6.QtDBus ^
+  %UPXOPT% ^
   main.py
 if errorlevel 1 goto failed
 
