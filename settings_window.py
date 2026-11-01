@@ -16,13 +16,18 @@
 """
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes as wintypes
+import sys
 import traceback
 
 from PyQt6.QtCore import (
-    QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRect, QRectF, QSize,
-    Qt, QTimer, QUrl, pyqtProperty, pyqtSignal,
+    QAbstractAnimation, QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRect,
+    QRectF, QSize, Qt, QTimer, QUrl, pyqtProperty, pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
+from PyQt6.QtGui import (
+    QColor, QDesktopServices, QFont, QPainter, QPainterPath, QPen, QPolygon, QRegion,
+)
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -399,6 +404,51 @@ class SmoothSlider(QSlider):
         except Exception:
             traceback.print_exc()
 
+class CloseButton(QToolButton):
+    """0.10.07.26：自绘的关闭按钮，保证"×"落在按钮的几何正中心。
+
+    为什么不用 QToolButton 的文本：`×` 的基线随字体（Microsoft YaHei 等）自带
+    上下留白，加上 QToolButton 默认按文本矩形居中，实际笔画会偏下偏左，不同 DPI
+    下偏移量还不一样。这里改成两笔画线，坐标直接取 width()/2 与 height()/2，
+    与字体、DPI 全部无关。
+    """
+
+    SIZE_W, SIZE_H = 32, 26
+    ARM = 4.6              # 半臂长，笔画总长 9.2px，视觉粗细接近 18px 的 ×
+    PEN_W = 1.6
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE_W, self.SIZE_H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("关闭")
+        self.setStyleSheet(
+            "QToolButton { background: transparent; border: none; }"
+            "QToolButton:hover { background-color: #30363d; border-radius: 4px; }"
+            "QToolButton:pressed { background-color: #21262d; }")
+
+    def paintEvent(self, event) -> None:
+        """先让 QSS 画 hover/pressed 背景，再用 QPainter 在正中心画两条斜线。"""
+        super().paintEvent(event)
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            pen = QPen(QColor("#c9d1d9"))
+            pen.setWidthF(self.PEN_W)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            # 用浮点矩形中心，避免 width()/2 与整数像素网格的半像素偏差
+            center = QRectF(self.rect()).center()
+            cx, cy = center.x(), center.y()
+            a = self.ARM
+            painter.drawLine(QPointF(cx - a, cy - a), QPointF(cx + a, cy + a))
+            painter.drawLine(QPointF(cx - a, cy + a), QPointF(cx + a, cy - a))
+        except Exception:
+            traceback.print_exc()
+        finally:
+            painter.end()
+
+
 class TitleBar(QWidget):
     """0.10.07.19 无边框设置窗口的自绘标题栏：深色背景 + 标题 + 关闭按钮 + 拖动。"""
 
@@ -417,15 +467,10 @@ class TitleBar(QWidget):
         self._title.setStyleSheet(
             "color: #e6edf3; font-size: 13px; font-weight: 600; background: transparent;")
         layout.addWidget(self._title, 1)
-        self._close_btn = QToolButton()
-        self._close_btn.setText("×")
+        # 0.10.07.26：× 改成自绘（CloseButton），QToolButton 的文本基线会随
+        # 字体上下留白偏移，不同 DPI 下看起来"偏下偏左"。
+        self._close_btn = CloseButton()
         self._close_btn.setToolTip("关闭")
-        self._close_btn.setFixedSize(32, 26)
-        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._close_btn.setStyleSheet(
-            "QToolButton { background: transparent; border: none; color: #c9d1d9; font-size: 18px; }"
-            "QToolButton:hover { background-color: #30363d; border-radius: 4px; }"
-            "QToolButton:pressed { background-color: #21262d; }")
         self._close_btn.clicked.connect(self._on_close)
         layout.addWidget(self._close_btn)
 
@@ -526,6 +571,16 @@ class SettingsWindow(QDialog):
         self._open_force_timer.setSingleShot(True)
         self._open_force_timer.timeout.connect(self._force_open_animation_end)
         self._button_anims = {}
+        # 0.10.07.25：Win11 系统圆角只申请一次；跨屏防变形用的尺寸锁
+        self._rounded_applied = False
+        # 0.10.07.26：圆角看门狗——窗口可见期间每 500ms 校验一次 DWM 圆角偏好，
+        # 被系统重置成默认（0=直角）就立刻补回 2（圆角）。
+        self._region_size = None
+        self._corner_timer = QTimer(self)
+        self._corner_timer.setInterval(500)
+        self._corner_timer.timeout.connect(self._ensure_rounded_corners_live)
+        self._locked_size = None
+        self._resize_guard = False
 
         # ---- 设置锁（顶部）：锁上才把配置写进 JSON，重启保留 ----
         lock_row = QHBoxLayout()
@@ -932,32 +987,22 @@ class SettingsWindow(QDialog):
     # ------------------------------------------------------------------ 显示前准备
 
     def prepare_for_show(self) -> None:
-        """显示前按当前屏幕的可用高度限高，并把滚动条回到顶部。
+        """show 之前只做"清状态 + 定宽度 + 放宽高度上限"，尺寸与位置交给 showEvent。
 
-        为什么：本窗口内容实测约 883 px，1080p + 150% 缩放下逻辑可用高度只有约 720 px，
-        Windows 会把过高的窗口摆到奇怪位置，甚至压住任务栏上的挂件。
-        这里把最大高度限制为「可用高度 - 80」（预留任务栏与缝隙）、最小 400，
-        放不下的部分交给 QScrollArea 滚动，低分辨率机器也能完整操作。
+        0.10.07.27：旧实现在这里就算高度并 resize，但 Qt 会在 show() 时按自己的
+        规则重新布局一次（实测会把窗口撑回上一次的 803 高、并挪到旧坐标），
+        于是"算好的高度/位置"全部作废。现在这里只把上一次的 _locked_size 清掉，
+        真正的一次性定尺寸+定位放到 showEvent 的 _fit_and_place()。
         """
         try:
+            self._locked_size = None                  # 彻底丢弃上一次的尺寸状态
             screen = self._panel.screen() or QApplication.primaryScreen()
-            if screen is None:
-                return
-            avail = screen.availableGeometry()
-            # 死命令：设置窗口高度绝不超过 750px；放不下的调试值交给滚动区
-            max_h = min(750, max(400, avail.height() - 80))
+            if screen is not None:
+                avail = screen.availableGeometry()
+                self.setMaximumHeight(max(400, min(1000, avail.height() - 20)))
             self.setMinimumHeight(400)
-            self.setMaximumHeight(max_h)
-
-            # 尺寸以内容 sizeHint 为准：宽度不足会把控件挤扁，高度超过上限则滚动
-            frame = 2 * self._scroll.frameWidth()
-            content = self._scroll.widget()
-            hint = content.sizeHint() if content is not None else self.sizeHint()
-            # 死命令：宽度约 600~700，双列一屏；高度不超过 750
-            width = min(700, max(self.minimumWidth(), hint.width() + frame))
-            height = min(max(400, hint.height() + frame), max_h)
-            self.resize(width, height)
-            self._scroll.verticalScrollBar().setValue(0)   # 每次打开都从顶部开始
+            self.setMinimumWidth(640)
+            self.resize(700, 700)                     # 占位，showEvent 会马上改成真实尺寸
         except Exception:
             traceback.print_exc()
 
@@ -979,12 +1024,13 @@ class SettingsWindow(QDialog):
             # 注意：这里不能再检查 _fade_anim（恢复默认设置的淡出动画）。
             # 打开流程已由主窗口把 windowOpacity 设为 0，若因无关动画仍在跑而提前
             # return，就会留下 opacity=0 的"隐形窗口"，正是本轮要消灭的消失问题。
+            # 0.10.07.27：位置在 show() 之前就定好了，这里只做透明度淡入，
+            # 不再对 geometry 做 +15px 位移动画——那正是"先出现在错位置、
+            # 再弹回正确位置"的观感来源。
             final = QRect(self.geometry())
             self._open_final_geometry = final
             self.setWindowOpacity(0.0)
-            start = QRect(final.x(), final.y() + 15,
-                          final.width(), final.height())
-            self.setGeometry(start)
+            start = QRect(final)
 
             opacity_anim = QPropertyAnimation(self, b"windowOpacity", self)
             opacity_anim.setDuration(250)
@@ -992,18 +1038,14 @@ class SettingsWindow(QDialog):
             opacity_anim.setEndValue(1.0)
             opacity_anim.setEasingCurve(QEasingCurve.Type.OutExpo)
 
-            geom_anim = QPropertyAnimation(self, b"geometry", self)
-            geom_anim.setDuration(250)
-            geom_anim.setStartValue(start)
-            geom_anim.setEndValue(final)
-            geom_anim.setEasingCurve(QEasingCurve.Type.OutExpo)
-            geom_anim.finished.connect(self._finish_open_animation)
-
+            # 0.10.07.27：不再创建 geometry 动画。位置已经由主窗口在 show() 后、
+            # 透明期里一次性摆好；任何后续 setGeometry 都会把窗口拉回上一次的
+            # 旧几何，正是"先错位再弹一下"的来源。这里只保留透明度淡入。
             self._open_anim = opacity_anim
-            self._open_geom_anim = geom_anim
+            self._open_geom_anim = None
+            opacity_anim.finished.connect(self._finish_open_animation)
             self._open_force_timer.start(400)
             opacity_anim.start()
-            geom_anim.start()
         except Exception:
             traceback.print_exc()
 
@@ -1019,6 +1061,9 @@ class SettingsWindow(QDialog):
             eff = self._scroll.graphicsEffect()
             if isinstance(eff, QGraphicsOpacityEffect):
                 self._scroll.setGraphicsEffect(None)
+            # 0.10.07.26：弹入动画期间窗口是分层窗口（opacity<1），DWM 圆角会被
+            # 系统暂时忽略；动画结束、opacity 回到 1.0 之后再补一次，圆角才稳定。
+            self._apply_win11_rounded_corners()
         except Exception:
             traceback.print_exc()
 
@@ -1037,6 +1082,9 @@ class SettingsWindow(QDialog):
             eff = self._scroll.graphicsEffect()
             if isinstance(eff, QGraphicsOpacityEffect):
                 self._scroll.setGraphicsEffect(None)
+            # 0.10.07.26：弹入动画期间窗口是分层窗口（opacity<1），DWM 圆角会被
+            # 系统暂时忽略；动画结束、opacity 回到 1.0 之后再补一次，圆角才稳定。
+            self._apply_win11_rounded_corners()
         except Exception:
             traceback.print_exc()
 
@@ -1054,6 +1102,9 @@ class SettingsWindow(QDialog):
             eff = self._scroll.graphicsEffect()
             if isinstance(eff, QGraphicsOpacityEffect):
                 self._scroll.setGraphicsEffect(None)
+            # 0.10.07.26：弹入动画期间窗口是分层窗口（opacity<1），DWM 圆角会被
+            # 系统暂时忽略；动画结束、opacity 回到 1.0 之后再补一次，圆角才稳定。
+            self._apply_win11_rounded_corners()
         except Exception:
             traceback.print_exc()
         finally:
@@ -1097,6 +1148,14 @@ class SettingsWindow(QDialog):
         """每次打开都重置为"调试模式关闭"，并同步最新真实读数。"""
         super().showEvent(event)
         try:
+            # 0.10.07.26：Win11 圆角（DWM）在"显示后"多补几次。窗口创建/透明度动画
+            # 结束、以及 Qt 重建原生窗口时，系统都可能把圆角偏好重置回默认（直角），
+            # 单次调用无法保证第二次打开仍是圆角，这里用几次幂等重试兜住。
+            for delay in (0, 350, 700, 1200):
+                QTimer.singleShot(delay, self._apply_win11_rounded_corners)
+            self._apply_rounded_region()
+            if not self._corner_timer.isActive():
+                self._corner_timer.start()
             self._refresh_labels()
             self._sync_sliders_from_real()
             self._debug_check.blockSignals(True)
@@ -1121,7 +1180,195 @@ class SettingsWindow(QDialog):
             self.sync_show_ticks()
             self._sync_lock_button()
             self._refresh_mode_dependent_ui()
+            # 0.10.07.27：布局在 show 时才最终结算，尺寸与位置必须在这之后一次性定死。
+            # 之前是"show 前算一次 + show 后挪一次"，Qt 会在 show 时按旧几何重排，
+            # 于是窗口先出现在旧位置、再被拉回去——这就是"闪跳/回弹"。
+            self._fit_and_place()
             # 0.10.07.13：弹入动画由主窗口在贴底定位后调用 start_open_animation()
+        except Exception:
+            traceback.print_exc()
+
+    def _fit_and_place(self) -> None:
+        """按当前内容的真实高度定尺寸，并一次性贴到可用区底部。
+
+        0.10.07.27：所有"打开时该多大、该在哪"的计算集中在这里，只调用一次，
+        且在 showEvent 里（窗口已经完成布局、但还没画第一帧），因此用户看不到
+        中间位置，也不会出现"先错位再弹回"。
+        """
+        try:
+            screen = self._panel.screen() or QApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.availableGeometry()
+            max_h = max(400, min(1000, area.height() - 20))
+            self.setMaximumHeight(max_h)
+            self.setMinimumHeight(400)
+
+            frame = 2 * self._scroll.frameWidth()
+            content = self._scroll.widget()
+            hint = content.sizeHint() if content is not None else self.sizeHint()
+            want_w = min(700, max(self.minimumWidth(), hint.width() + frame))
+            want_h = int(hint.height()) + frame + self._title_bar.height()
+            want_h = min(max(400, want_h), max_h)
+
+            self._locked_size = QSize(want_w, want_h)   # 先锁，避免 resizeEvent 拉回旧值
+            self.setGeometry(area.left(), area.bottom() - want_h, want_w, want_h)
+            self._scroll.verticalScrollBar().setValue(0)
+        except Exception:
+            traceback.print_exc()
+
+    def resizeEvent(self, event) -> None:
+        """0.10.07.25：跨屏/多 DPI 拖动时，防止设置窗口被瞬间挤成细长条。
+
+        现象：把设置面板往左/右拖过屏幕边缘，有概率变成一条很窄的横向长条，
+        而且再也回不来。原因：无边框窗口跨越不同缩放比例的屏幕时，Qt 会按新屏幕
+        重新换算逻辑尺寸，再叠加"内容高度上限 + 滚动区"的布局重排，宽高会被算成
+        不合理的值。这里只做一件事：一旦尺寸掉到"最小宽度/最小高度"以下，
+        立刻拉回显示前锁定的尺寸；正常布局重排（大于下限）一律不干预。
+
+        注意：_resize_guard 防重入；动画期间（打开动画只动 y）不介入。
+        """
+        super().resizeEvent(event)
+        try:
+            self._apply_rounded_region()
+            if self._resize_guard or self._locked_size is None:
+                return
+            if (self._open_geom_anim is not None
+                    and self._open_geom_anim.state() == QAbstractAnimation.State.Running):
+                return
+            if event.size() == self._locked_size:
+                return                     # 尺寸没变，交给布局自己排
+            self._resize_guard = True
+            try:
+                self.resize(self._locked_size)
+            finally:
+                self._resize_guard = False
+        except Exception:
+            traceback.print_exc()
+
+    def wheelEvent(self, event) -> None:
+        """0.10.07.25：滚轮统一交给滚动区，避免与调试卡的高度动画打架。
+
+        现象：打开设置后滚轮一滚，弹出的"调试设置"区域会出现半截卡片/错位。
+        原因：调试卡展开/收起是 250ms 的 maximumHeight 动画，滚动同时触发
+        QScrollArea 重排，两者一起改几何。这里在动画进行中先把动画一次性收敛到
+        终态，再把滚轮量交给滚动条；滑块/下拉框不再有机会截获滚轮改数值。
+        """
+        try:
+            if (self._rows_anim is not None
+                    and self._rows_anim.state() == QAbstractAnimation.State.Running):
+                self._force_rows_animation_end()
+            bar = self._scroll.verticalScrollBar()
+            bar.setValue(bar.value() - event.angleDelta().y())
+            event.accept()
+        except Exception:
+            traceback.print_exc()
+
+    def _apply_win11_rounded_corners(self) -> None:
+        """0.10.07.25：给无边框设置窗口申请 Win11 的系统圆角（DWM）。
+
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33，DWMWCP_ROUND = 2。
+        非 Win11 或调用失败时静默忽略——窗口本来就有自绘圆角兜底，不会因此崩。
+
+        0.10.07.26：去掉"只应用一次"的短路。窗口 close() 后 Qt 可能重建原生
+        窗口（HWND 变了），DWM 属性跟着丢，第二次打开就变回直角；这里每次
+        showEvent 都重新写一次，幂等且开销可忽略。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            hwnd = self._native_top_level_handle()
+            if not hwnd:
+                return
+            dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
+            set_attr = dwm.DwmSetWindowAttribute
+            set_attr.argtypes = [wintypes.HWND, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+            set_attr.restype = ctypes.c_long
+            preference = ctypes.c_int(2)          # DWMWCP_ROUND
+            set_attr(wintypes.HWND(hwnd), 33,       # DWMWA_WINDOW_CORNER_PREFERENCE
+                     ctypes.cast(ctypes.byref(preference), ctypes.c_void_p),
+                     ctypes.sizeof(preference))
+            self._rounded_applied = True
+        except Exception:
+            traceback.print_exc()
+
+    def _apply_rounded_region(self) -> None:
+        """0.10.07.26：圆角的最后一道兜底——用 Qt 窗口遮罩裁出圆角。
+
+        背景：Win11 的 DWM 圆角对"无边框 + 自绘"的窗口并不可靠（实测同一次运行里
+        调用返回成功、读回却是 0=直角）。SetWindowRgn 在这类窗口上同样会被忽略。
+        Qt 的 setMask 是进程内裁剪，与 DWM、DPI、窗口重建全无关系，只要窗口显示
+        就一定生效，因此作为最终保证。
+
+        只在尺寸变化时重设，避免每 500ms 改一次遮罩造成闪烁。
+        """
+        try:
+            w, h = self.width(), self.height()
+            if w <= 0 or h <= 0:
+                return
+            if self._region_size == (w, h):
+                return
+            path = QPainterPath()
+            # 与视觉圆角一致：半径 8px（直径 16）
+            path.addRoundedRect(QRectF(0, 0, w, h), 8.0, 8.0)
+            polygon = QPolygon([p.toPoint() for p in path.toFillPolygon()])
+            self.setMask(QRegion(polygon))
+            self._region_size = (w, h)
+        except Exception:
+            traceback.print_exc()
+
+    def _native_top_level_handle(self) -> int:
+        """取本窗口真正的顶层 HWND。
+
+        0.10.07.26：设置窗口是用父窗口构造的（`super().__init__(panel)`），
+        某些 DPI/重建路径下 `winId()` 拿到的是子窗口句柄，DWM 属性写到它上面
+        不会生效（表现：调用成功、界面仍是直角）。这里优先用 Qt 的
+        windowHandle().winId()（顶层 QWindow），失败再退回 winId()。
+        """
+        try:
+            handle = self.windowHandle()
+            if handle is not None:
+                wid = int(handle.winId())
+                if wid:
+                    return wid
+        except Exception:
+            pass
+        try:
+            return int(self.winId())
+        except Exception:
+            return 0
+
+    def _read_corner_preference(self) -> int:
+        """读回当前的 DWM 圆角偏好；读不到返回 -1。"""
+        try:
+            hwnd = self._native_top_level_handle()
+            if not hwnd:
+                return -1
+            dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
+            get_attr = dwm.DwmGetWindowAttribute
+            get_attr.argtypes = [wintypes.HWND, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+            get_attr.restype = ctypes.c_long
+            value = ctypes.c_int(-1)
+            get_attr(wintypes.HWND(hwnd), 33,
+                     ctypes.cast(ctypes.byref(value), ctypes.c_void_p),
+                     ctypes.sizeof(value))
+            return int(value.value)
+        except Exception:
+            return -1
+
+    def _ensure_rounded_corners_live(self) -> None:
+        """看门狗：窗口可见期间发现圆角被系统重置，就立刻补回。
+
+        实测：窗口 close() 后重开、或弹入动画结束后，DWM 圆角偏好偶尔会被系统
+        重置为 0（直角），单次调用无法保证稳定。这里每 500ms 读一次，只在
+        "不是 2" 时才写，开销是一次 DWM 读取，可忽略。
+        """
+        try:
+            if not self.isVisible():
+                return
+            if self._read_corner_preference() != 2:
+                self._apply_win11_rounded_corners()
+            self._apply_rounded_region()
         except Exception:
             traceback.print_exc()
 
@@ -1154,6 +1401,9 @@ class SettingsWindow(QDialog):
                 self._scroll.setGraphicsEffect(None)
                 self._fade_effect = None
             self._reset_all_btn.setEnabled(True)
+            # 0.10.07.26：窗口隐藏就停看门狗，避免后台空转
+            if self._corner_timer.isActive():
+                self._corner_timer.stop()
             self._stop_open_animation()
             self._reset_on_close()
         except Exception:

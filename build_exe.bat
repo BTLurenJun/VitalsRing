@@ -2,12 +2,12 @@
 setlocal
 cd /d "%~dp0"
 rem ============================================================
-rem  VitalsRing 打包脚本（PyInstaller 单目录 + 控制台）
+rem  VitalsRing 打包脚本（PyInstaller 单目录 + 无控制台）
 rem  用法：双击本文件，或在本目录命令行执行 build_exe.bat
 rem  产物：dist\VitalsRing\VitalsRing.exe（整个 VitalsRing 目录一起拷走才能运行）
 rem  说明：
 rem   1. 只调用项目内 .venv，不污染全局环境；
-rem   2. 单目录 + 控制台：先保证能跑，不追求体积最小；
+rem   2. 单目录 + 无控制台（--windowed）：双击只出挂件，不弹黑框；
 rem   3. --collect-submodules PyQt6 防止漏掉 Qt 平台插件导致启动即崩；
 rem   4. PyInstaller 只是打包工具，不写进 requirements.txt。
 rem  本文件以 GBK 编码保存，不使用 chcp，避免命令行解析乱码。
@@ -32,12 +32,12 @@ echo [2/4] 清理旧的 build 与 dist ...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
 
-echo [3/4] 调用 PyInstaller（单目录 + 控制台，约 1-3 分钟）...
+echo [3/4] 调用 PyInstaller（单目录 + 无控制台，约 1-3 分钟）...
 ".venv\Scripts\python.exe" -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --onedir ^
-  --console ^
+  --windowed ^
   --name VitalsRing ^
   --collect-submodules PyQt6 ^
   --exclude-module tkinter ^

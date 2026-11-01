@@ -36,7 +36,7 @@ from settings_window import SettingsWindow
 
 # 版本号规则（总需求第十三条）：0.10.轮次.修改次数
 # 第 7 轮终极重构 0.10.07.22
-APP_VERSION = "0.10.07.23"
+APP_VERSION = "0.10.07.27"
 APP_AUTHOR = "BTLurenJun"                                    # 作者署名
 APP_REPO_URL = "https://github.com/BTLurenJun/VitalsRing"    # 项目仓库地址
 
@@ -46,6 +46,7 @@ CREDITS = [
     ("AI 架构与辅助设计", "鲸鱼（Whale）"),
     ("代码实现", "闪电（Flash）"),
     ("代码审查", "大白鲨（Shark）"),
+    ("AI 辅助设计", "露露"),
 ]
 
 # 第六轮：设置持久化文件（开发时项目根目录；打包后与 exe 同目录；已加入 .gitignore，绝不入库）
@@ -500,6 +501,12 @@ class VitalPanel(QWidget):
         self._boot_collapsed = False      # "开机时长"是否已折叠（只留标题）
         self._os_collapsed = False        # "系统版本"是否已折叠（只留标题）
         self._settings = None             # 设置窗口实例（懒创建、复用，避免每次点击都新建对象）
+        # 0.10.07.24：设置窗口首次构造实测要 500~800ms，用户以为没点上就会再点一次，
+        # 表现为"首次点齿轮要点两次"。启动后静默预热一次，让第一次点击就能立刻显示。
+        self._prewarm_started = False
+        self._settings_shown_ts = 0.0     # 设置窗口最近一次打开的时刻（防手抖连点把它关掉）
+        # 0.10.07.25：吸附状态下只响应点击、绝不进入拖动（拖拽会被 mousePress 拦掉）
+        self._press_docked = False
         # 设置锁：True = 修改后立即写 JSON、重启保留；False = 只留内存、重启回默认
         self._lock_state = False
         # 0.10.07.22：写盘失败本次运行只提示一次，避免拖动/切换时反复弹窗
@@ -681,6 +688,11 @@ class VitalPanel(QWidget):
                 self._dock_now()
             self._install_win_event_hook()
             self._raise_above_taskbar()
+            # 0.10.07.24：启动 1.2 秒后静默预热设置窗口——
+            # 首次构造要 500~800ms，预热后第一次点齿轮就不会"点一下没反应"了。
+            if not self._prewarm_started:
+                self._prewarm_started = True
+                QTimer.singleShot(1200, self._prewarm_settings)
             if AUTO_DOCK_ENABLED and self._auto_dock_enabled and not self._dock_timer.isActive():
                 self._dock_timer.start()
         self._on_refresh_tick()
@@ -788,6 +800,31 @@ class VitalPanel(QWidget):
             self.move(max(area.left(), x), max(area.top(), y))
         except Exception:
             # 混合 DPI 下屏幕几何偶尔会出现异常值；这里兜住，避免缩放/切换模式时直接把进程带崩
+            traceback.print_exc()
+
+    def _place_panel_mode(self) -> None:
+        """0.10.07.25：大面板落位——贴当前屏幕可用区底部，整块都在可用区内。
+
+        为什么单独写：原来的 _keep_on_screen() 只做"左上角可见"的钳制，大面板从
+        挂件的底部位置（y≈1394）长出 700+ px 后，会被算到屏幕外再被钳回来，结果
+        出现在挂件上方、还被设置窗口压住。这里改成"先按可用区右下角对齐"：
+        宽度超了就左移、高度超了就上移，保证整块面板不越界，也不会盖住任务栏。
+        """
+        try:
+            screen = self._screen_for_window() or QApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.availableGeometry()
+            width = self._clamp_width(self.width())
+            height = self.height()
+            # 以"可用区右下角"为锚点：面板通常靠右下站着，和任务栏图标区不打架
+            x = area.right() - width
+            y = area.bottom() - height
+            x = max(area.left(), min(x, area.right() - width))
+            y = max(area.top(), min(y, area.bottom() - height))
+            self.resize(width, height)
+            self.move(x, y)
+        except Exception:
             traceback.print_exc()
 
     def _ensure_reachable(self) -> None:
@@ -2200,8 +2237,11 @@ class VitalPanel(QWidget):
                 w = self._clamp_width(self._max_width - 44)
                 self.resize(w, self.heightForWidth(w))
                 self._apply_background_mode()
-                self._keep_on_screen()
+                self._place_panel_mode()          # 0.10.07.25：贴可用区底部，整块可见
                 self._apply_native_window_style()
+                # 0.10.07.25：切换后立刻抬到最前，避免被设置窗口/任务栏压住
+                self.raise_()
+                self._raise_above_taskbar(force=True)
             self.update()
         except Exception:
             traceback.print_exc()
@@ -2254,8 +2294,7 @@ class VitalPanel(QWidget):
                 if DEBUG_LOG:
                     print("[raise] 检测到弹出菜单/下拉框或模态窗口，跳过本次置顶")
                 return
-            if self._layout_mode != "widget":
-                return
+            # 0.10.07.25：大面板同样需要置顶——否则切到大面板后会被设置窗口压住
             now = time.monotonic()
             if not force and now - self._last_raise_ts < 0.1:
                 return
@@ -2411,25 +2450,6 @@ class VitalPanel(QWidget):
         except Exception:
             traceback.print_exc()
 
-    def _undock_for_drag(self) -> None:
-        """拖动挂件时只取消"当前吸附状态"，绝不修改用户的吸附勾选。
-
-        注意：_auto_dock_enabled 是用户设置（只有设置窗口/全局开关能改），
-        这里只把 _docked 置 False；松手后 4 秒 tick 会把它自动吸回任务栏。
-        想永久不吸附，请用户去设置窗口取消勾选。
-        """
-        try:
-            if not self._docked:
-                return
-            self._docked = False
-            self._dock_rect = None
-            self.dock_status_text = "拖动中（松手后会自动吸回）"
-            # 未吸附 → 背景必须从全透明退回深色，否则文字浮在桌面上看不清
-            self._apply_background_mode()
-            self.update()
-        except Exception:
-            traceback.print_exc()
-
     def _dock_now(self) -> None:
         """把挂件贴到任务栏左侧（垂直居中）；任何失败都保持可拖动、不崩溃。"""
         if self._layout_mode != "widget":
@@ -2520,8 +2540,10 @@ class VitalPanel(QWidget):
                 self._apply_background_mode()
                 self.update()
                 return
-            # 任务栏矩形变了（分辨率/DPI 变化、任务栏换边、Explorer 重建）→ 重新定位
-            if not self._docked or rect != self._dock_rect:
+            # 0.10.07.25：只在"任务栏几何真的变了"（分辨率/DPI/任务栏换边/Explorer 重建）
+            # 时重新定位；不再因为 _docked 为假就把窗口吸回去——那正是"拖走几秒后
+            # 被生硬弹回"的来源，现已彻底删除。
+            if rect != self._dock_rect:
                 self._dock_now()
             self._update_dock_visibility()
             # 每 4 秒校正一次背景：窗口可能被意外挪离任务栏而 _docked 仍是 True，
@@ -2783,8 +2805,13 @@ class VitalPanel(QWidget):
     def mousePressEvent(self, event) -> None:
         """左键按下：右下角热区调整宽度，其余区域既可能拖动窗口、也可能是"点击切换"。
 
-        注意：这里不能立刻执行切换动作——按下就切换的话，拖动窗口时会被误触发，
-        因此只记录"候选动作"，等到松开时再判断这次到底是点击还是拖动。
+        注意：数据环/文字行这类"切换"动作不能按下就执行——拖动窗口时会被误触发，
+        因此仍只记录"候选动作"，等到松开时再判断这次到底是点击还是拖动。
+
+        0.10.07.24：齿轮是"按钮"而不是"拖拽面"，改为按下即响应，不再等松开。
+        原因：挂件是 WS_EX_NOACTIVATE 的置顶窗口，首次点击可能被系统拿去激活窗口
+        或重排层级，导致这一对 press/release 只剩一半，表现为"第一次点齿轮没反应、
+        要点第二次"。按钮在 press 阶段就执行，绕开对 release 事件的依赖。
         """
         try:
             if DEBUG_LOG:
@@ -2792,13 +2819,14 @@ class VitalPanel(QWidget):
                       f"dpr={self.devicePixelRatioF():.2f}")
             if event.button() != Qt.MouseButton.LeftButton:
                 return
-            # 挂件已吸附时，用户一点就先把挂件抬到任务栏之上（按键判断之后立即执行），
-            # 避免详情/设置窗口成为前台后把挂件挤到下面（此时钩子被 SKIPOWNPROCESS 跳过）。
-            # 点击后任务栏/前台窗口可能再次抢占层级，追加两次延迟提升；
-            # 延迟枪用 force=True 绕过去重——打开设置窗口时 show() 可能阻塞事件循环，
-            # 两枪实际间隔会被压到 100ms 内，不绕过就会被去重吞掉一枪。
+            # 挂件已吸附时，用户一点就先把挂件抬到任务栏之上（按键判断之后执行）。
+            # 0.10.07.24：立即提升延到"下一轮事件循环"再执行——在 press 处理里同步
+            # 调 SetWindowPos 会改 z 序，可能让 Windows 丢掉本次鼠标捕获，于是
+            # release 不再送达、这次点击被判成没发生（首次点齿轮要点两次的成因之一）。
+            # 延迟枪仍用 force=True 绕过去重：打开设置窗口时 show() 可能阻塞事件循环，
+            # 120ms 与 500ms 两枪实际间隔会被压到 100ms 内，不绕过就会被去重吞掉一枪。
             if self._layout_mode == "widget" and self._docked:
-                self._raise_above_taskbar()
+                QTimer.singleShot(0, self._raise_above_taskbar)
                 QTimer.singleShot(120, lambda: self._raise_above_taskbar(force=True))
                 QTimer.singleShot(500, lambda: self._raise_above_taskbar(force=True))
             pos = event.position()
@@ -2813,10 +2841,25 @@ class VitalPanel(QWidget):
                 self._resize_start_x = event.globalPosition().x()
                 self._resize_start_w = self.width()
                 return
+            action = self._hit_action(pos)
+            if action == "settings":
+                # 齿轮按钮：按下就开/关设置窗口，并且不进入拖动状态。
+                # 这样即使 release 被系统吞掉，用户也只点一下；代价是"从齿轮上按下
+                # 拖动窗口"不再生效（其余四个环与环间缝隙仍可拖动）。
+                self._apply_action("settings")
+                return
+            # 0.10.07.25：开启"任务栏吸附"且已经吸附时，挂件绝对不允许被拖走。
+            # 只记录候选动作（数据环 → 详情窗口），松开时按点击处理；不进入拖动状态，
+            # 也就不会出现"拖走 → 几秒后生硬弹回"的观感。
+            if (self._layout_mode == "widget" and self._docked
+                    and AUTO_DOCK_ENABLED and self._auto_dock_enabled):
+                self._press_docked = True
+                self._pending_action = action
+                return
             self._dragging = True
             # 0.10.07.13：记录鼠标与窗口左上角的固定 offset
             self._drag_offset = event.globalPosition().toPoint() - self.pos()
-            self._pending_action = self._hit_action(pos)
+            self._pending_action = action
         except Exception:
             # PyQt6 里事件处理函数抛未捕获异常会直接终止进程，表现就是"窗口闪一下消失"
             traceback.print_exc()
@@ -2848,6 +2891,9 @@ class VitalPanel(QWidget):
                 # 可能把文本行 / 版本号 / 缩放手柄推出屏幕底部，所以这里收回一次
                 self._keep_on_screen()
                 return
+            if self._press_docked:
+                # 0.10.07.25：吸附状态下鼠标移动一概忽略，挂件纹丝不动
+                return
             if not self._dragging:
                 return
             if not self._moved:
@@ -2864,8 +2910,8 @@ class VitalPanel(QWidget):
             # 0.10.07.13 按本轮指令：每帧严格用 globalPosition - _drag_offset 绝对定位，
             # 不做逐帧 _keep_on_screen / 可视性判断；松手时再收回屏幕一次。
             target = event.globalPosition().toPoint() - self._drag_offset
-            if self._docked:
-                self._undock_for_drag()
+            # 0.10.07.25：不再"拖走 → 取消吸附 → 稍后弹回"；吸附由 mousePress 直接拦住，
+            # 走到这里的只可能是用户已在设置里关掉"任务栏吸附"的自由拖动。
             self.move(target)
         except Exception:
             # PyQt6 里事件处理函数抛未捕获异常会直接终止进程，表现就是"窗口闪一下消失"
@@ -2899,7 +2945,8 @@ class VitalPanel(QWidget):
             # 不判按键时，左键按住期间松开右键会误执行待定的模式切换
             if event.button() != Qt.MouseButton.LeftButton:
                 return
-            if self._dragging and not self._moved and self._pending_action is not None:
+            # 0.10.07.25：吸附状态下的"只点不拖"也要执行候选动作（详情窗口）
+            if (self._dragging or self._press_docked) and not self._moved and self._pending_action is not None:
                 self._apply_action(self._pending_action)
             if self._dragging:
                 # 拖动结束把窗口收回屏幕内，避免松手后窗口留在屏幕外找不回来
@@ -2912,6 +2959,7 @@ class VitalPanel(QWidget):
                           f"dpr={self.devicePixelRatioF():.2f}")
             self._dragging = False
             self._resizing = False
+            self._press_docked = False
             self._pending_action = None
         except Exception:
             # PyQt6 里事件处理函数抛未捕获异常会直接终止进程，表现就是"窗口闪一下消失"
@@ -2994,33 +3042,73 @@ class VitalPanel(QWidget):
         """
         try:
             if self._settings is not None and self._settings.isVisible():
+                # 0.10.07.24：刚打开 350ms 内的重复点击视为"手抖/等不及"，
+                # 不当作收起——否则首次打开稍慢时，第二下点击反而把窗口关掉，
+                # 用户看到的就是"点两次才有反应"。
+                if time.monotonic() - self._settings_shown_ts < 0.35:
+                    return
                 self._settings.close()      # 触发 _reset_on_close 复位调试状态
                 self._raise_above_taskbar()
                 return
             if self._detail is not None and self._detail.isVisible():
                 self._detail.close()
-            if self._settings is None:
-                # 作者与仓库地址统一来自本文件顶部常量，避免在设置窗口里再定义一份
-                self._settings = SettingsWindow(
-                    self._reader, self, APP_VERSION,
-                    repo_url=APP_REPO_URL, author=APP_AUTHOR,
-                    auto_dock_available=bool(AUTO_DOCK_ENABLED),
-                    credits=CREDITS,
-                )
-            sw = self._settings
-            # 顺序很重要：先按屏幕限高（放不下时滚动），show() 让 Qt/Windows 定下最终尺寸，
-            # 再按"显示后的真实尺寸"摆放——实测 show() 会让窗口位置偏移约 31px，
-            # 先在 show 前摆放会被这一步带偏，最终压住挂件甚至超出可用区。
+            sw = self._ensure_settings()
+            # 0.10.07.27：先算尺寸 → 透明显示 → 立即纠正位置（此时 opacity=0，
+            # 用户看不见，不会闪跳）→ 再淡入。show() 会让 Qt/Windows 按自己的
+            # 规则重摆一次窗口（实测偏 ~50px），所以纠正必须发生在 show 之后，
+            # 但必须发生在动画之前，且窗口仍是全透明。
             sw.prepare_for_show()
-            # 0.10.07.13：先透明显示→贴底定位→再启动弹入动画，避免旧位置残影
             sw.setWindowOpacity(0.0)
+            if DEBUG_LOG:
+                print(f"[open] show 前 geometry={sw.geometry().getRect()} "
+                      f"size={sw.width()}x{sw.height()} pos=({sw.x()},{sw.y()})")
             sw.show()
-            self._place_settings_window(sw)
+            # 0.10.07.27：位置由 SettingsWindow.showEvent 里的 _fit_and_place()
+            # 一次性定好，这里不再 show 后挪窗口（那正是闪跳的来源）。
+            if DEBUG_LOG:
+                QTimer.singleShot(1000, lambda: print(
+                    f"[open] show 后 1s geometry={sw.geometry().getRect()} "
+                    f"size={sw.width()}x{sw.height()} pos=({sw.x()},{sw.y()})"))
             sw.raise_()
             sw.activateWindow()
             sw.start_open_animation()
+            # 记录打开时刻：350ms 内的重复点击不再当作"收起"
+            self._settings_shown_ts = time.monotonic()
             # 设置窗口出现后可能压住挂件，这里把挂件重新抬回任务栏之上
             self._raise_above_taskbar()
+        except Exception:
+            traceback.print_exc()
+
+    def _ensure_settings(self):
+        """懒创建设置窗口（只创建一次，之后复用）；构造失败时向上抛给调用方兜底。
+
+        0.10.07.24 抽出来，是为了让"点击时创建"和"启动预热"走同一条构造路径，
+        避免两处参数写岔。
+        """
+        if self._settings is None:
+            # 作者与仓库地址统一来自本文件顶部常量，避免在设置窗口里再定义一份
+            self._settings = SettingsWindow(
+                self._reader, self, APP_VERSION,
+                repo_url=APP_REPO_URL, author=APP_AUTHOR,
+                auto_dock_available=bool(AUTO_DOCK_ENABLED),
+                credits=CREDITS,
+            )
+        return self._settings
+
+    def _prewarm_settings(self) -> None:
+        """启动后静默预热设置窗口：只构造、不显示。
+
+        实测首次构造 SettingsWindow 要 500~800ms（大量控件、阴影、自绘标题栏），
+        用户点一下没反应就会再点一次，第二下又把刚打开窗口关掉——这就是"首次点
+        齿轮要点两次"的来源。提前在后台把对象造好，第一次点击就只剩 show()，
+        延迟降到几十毫秒。构造失败不抛给用户：真正点击时会再试一次并照常报错。
+        """
+        try:
+            if self._settings is not None:
+                return
+            self._ensure_settings()
+            if DEBUG_LOG:
+                print("[settings] 预热完成")
         except Exception:
             traceback.print_exc()
 
@@ -3032,8 +3120,14 @@ class VitalPanel(QWidget):
                 return
             area = screen.availableGeometry()
             w, h = sw.width(), sw.height()
+            # 0.10.07.26：每次打开都按"当前屏幕可用区"重算，绝不复用上一次的脏坐标；
+            # 底边严格贴 availableGeometry().bottom()，不再 +1（+1 会压进任务栏 1px）。
             x = area.left()
-            y = area.bottom() - h + 1
+            y = area.bottom() - h
+            x = max(area.left(), min(x, area.right() - w + 1))
+            y = max(area.top(), min(y, area.bottom() - h))
+            if DEBUG_LOG:
+                print(f"[settings] place {w}x{h} -> ({x},{y}) area={area}")
             sw.move(x, y)
         except Exception:
             traceback.print_exc()
